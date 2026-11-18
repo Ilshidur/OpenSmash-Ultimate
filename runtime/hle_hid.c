@@ -33,6 +33,9 @@ void pad_input_gate_set(int on) { input_gate = on; }
  * typed. Players 2-8 keep their pads. */
 static Seq seq;
 static int seq_on, seq_keyboard, seq_log_every;
+/* SSBU_SEQ_RELEASE=1: once the sequence has ended, player 1 gets its pad back
+ * (a person plays the fight the sequence set up). */
+static int seq_release;
 /* SSBU_SEQ2: player 2's own sequence, in the same language, in player 1's ticks (marks and draw counts
  * shared with player 1's), so a test can have both fighters act on cue (e.g. one throws
  * projectiles at the other's reflector). Player 2 is then connected as a Pro Controller and its pad
@@ -65,6 +68,7 @@ static BOOL CALLBACK seq_start(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     }
     seq_keyboard = (v = getenv("SSBU_SEQ_KEYBOARD")) && atoi(v) != 0;
     seq_log_every = (v = getenv("SSBU_SEQ_LOG")) ? atoi(v) : 0;
+    seq_release = (v = getenv("SSBU_SEQ_RELEASE")) && atoi(v) != 0;
     fprintf(stderr, "[seq] %d steps, counted in player 1's polls; player 1's pad is not read, the keyboard is %s\n", n,
             seq_keyboard ? "read (SSBU_SEQ_KEYBOARD)" : "nobody's");
     seq_on = 1;
@@ -150,7 +154,7 @@ static void seq2_player_poll(u64 *buttons, i32 *lx, i32 *ly) {
     if (seq2.ly) *ly = seq2.ly;
     ReleaseSRWLockExclusive(&lock);
 }
-static int seq_player(u32 id) { return (id == NPAD_NO1 && input_seq_on()) || (id == 1 && input_seq_on() && seq2_on); }
+static int seq_player(u32 id) { return (id == NPAD_NO1 && input_seq_on() && !(seq_release && seq_finished(&seq))) || (id == 1 && input_seq_on() && seq2_on); }
 int input_seq2_on(void) { return input_seq_on() && seq2_on; }
 static int keyboard_slot(void) { return input_seq_on() && !seq_keyboard ? -1 : pad_keyboard_slot(); }
 int bench_on(void);                         /* (hle_bench.c: a test run drives player 1 alone) */

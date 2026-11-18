@@ -1310,11 +1310,15 @@ static int xinput_start(void) {
 
 /* Pads 0-3 are players 1-4. A missing pad is asked for again every half second only: XInput is
  * slow to answer for an empty user index. */
+/* SSBU_XINPUT_EXTRA=<n>: with SDL, XInput pad n is read as well, as player n+1 (a program's
+ * virtual pad beside a person's SDL pad). It lives in the last device entry, which SDL only reaches with 16 pads. */
+static int xinput_extra = -1;
 static void xinput_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadInfo info[PAD_SLOTS]) {
     static ULONGLONG retry[4];
     ULONGLONG now = GetTickCount64();
     for (int i = 0; i < 4; i++) {
-        Dev *d = &devs[i];
+        if (xinput_extra >= 0 && i != xinput_extra) continue;
+        Dev *d = xinput_extra >= 0 ? &devs[sizeof devs / sizeof *devs - 1] : &devs[i];
         XState s;
         if (!d->used && now < retry[i]) continue;
         if (xinput_get_state((DWORD)i, &s)) {
@@ -1498,7 +1502,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
         SDL_JoystickID *ids = p_SDL_GetGamepads(&n);
         for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
             Dev *d = &devs[i];
-            if (!d->used || d->usb) continue;
+            if (!d->used || d->usb || d->xinput >= 0) continue;   /* (xinput: SSBU_XINPUT_EXTRA's pad, not SDL's) */
             int present = 0;
             for (int k = 0; k < n && !present; k++) present = ids[k] == d->id;
             if (present && p_SDL_GamepadConnected(d->gp)) continue;
@@ -1521,7 +1525,7 @@ static void sdl_poll(PadState fresh[PAD_SLOTS], char names[PAD_SLOTS][48], PadIn
     }
     for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++) {
         Dev *d = &devs[i];
-        if (!d->used || d->usb || d->slot < 0) continue;
+        if (!d->used || d->usb || d->slot < 0 || d->xinput >= 0) continue;
         Raw raw = {0};
         for (int b = 0; b < RB_COUNT; b++)
             if (p_SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)b)) raw.buttons |= 1u << b;
@@ -1727,6 +1731,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     usb_ignore = padusb_start();
     int sdl = sdl_start(), xinput = !sdl && xinput_start();
+    const char *extra = getenv("SSBU_XINPUT_EXTRA");
+    if (sdl && extra && *extra && atoi(extra) >= 0 && atoi(extra) < 4 && xinput_start()) {
+        xinput_extra = atoi(extra);
+        fprintf(stderr, "[input] SDL pads, and XInput pad %d as player %d (SSBU_XINPUT_EXTRA)\n", xinput_extra + 1, xinput_extra + 1);
+    }
     if (!sdl && !xinput && !usb_ignore) { fprintf(stderr, "[input] no SDL and no XInput: keyboard only\n"); return 0; }
     for (;;) {
         PadState fresh[PAD_SLOTS] = {0};
@@ -1734,6 +1743,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         static PadInfo info[PAD_SLOTS];
         memset(info, 0, sizeof info);
         if (InterlockedExchange(&reload_asked, 0)) config_reload(sdl);
+        if (xinput_extra >= 0) xinput_poll(fresh, names, info);   /* (first: its player slot is taken before SDL gives slots out) */
         if (sdl) sdl_poll(fresh, names, info);
         else if (xinput) xinput_poll(fresh, names, info);
         if (usb_ignore) usb_poll(fresh, names, info);
