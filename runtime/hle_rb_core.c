@@ -3483,6 +3483,31 @@ static void savestates(Cpu *c, u64 frame) {
         if (S.frames == auto_at) { auto_next = S.frames + auto_every; rb_save(c, frame); return; }
         if (S.frames > auto_at && S.frames >= auto_next && auto_left > 0) { auto_left--; auto_next = S.frames + auto_every; rb_load(c, frame); return; }
     }
+    /* Savestates on request: code in this process (a native mod) sets the environment
+     * variable SSBU_RB_REQ to "save" or "load"; it is read here, at the safe point. What was DONE is published in
+     * SSBU_RB_DONE as "<saves> <loads>" (counts since the start), so the mod can tell the frame a save or a load took
+     * effect: a request may be served a safe point later than the mod expects, and a load can be refused (a thread
+     * not parked in time), in which case it stays requested and is tried again at the next safe point.
+     * Nothing may follow rb_save / rb_load but the return (a load comes back through rb_save's call, which returns 2). */
+    {   static int req_saves, req_loads;
+        char req[16], done[32];
+        DWORD rn = GetEnvironmentVariableA("SSBU_RB_REQ", req, sizeof req);
+        if (rn > 0 && rn < sizeof req) {
+            SetEnvironmentVariableA("SSBU_RB_REQ", NULL);
+            if (!strcmp(req, "save")) {
+                int r = rb_save(c, frame);
+                if (r == 1) req_saves++; else if (r == 2) req_loads++;
+                snprintf(done, sizeof done, "%d %d", req_saves, req_loads);
+                SetEnvironmentVariableA("SSBU_RB_DONE", done);
+                return;
+            }
+            if (!strcmp(req, "load")) {
+                rb_load(c, frame);                               /* (returns only when the load was refused) */
+                SetEnvironmentVariableA("SSBU_RB_REQ", "load");  /* tried again at the next safe point */
+                return;
+            }
+        }
+    }
     int focused = gfx_window_focused();
     int save = focused && (GetAsyncKeyState(VK_F7) & 0x8000), load = focused && (GetAsyncKeyState(VK_F8) & 0x8000);
     int new_save = save && !prev_save, new_load = load && !prev_load;
