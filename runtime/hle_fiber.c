@@ -42,6 +42,7 @@ typedef struct Fib {
     int finalized;
     int running;        /* threads it runs on, or is being switched to or away from on (lock) */
     int spare_on_leave; /* finalized while running: spare once switched away from */
+    u64 born;           /* savestates made before its host fiber was (rb_serial then) */
 } Fib;
 
 static Fib *fibs[MAX_FIBERS];
@@ -53,6 +54,49 @@ static u32 reclaim_from;   /* slots before reclaim looks: 1024 (SSBU_FIBER_RECLA
 static SRWLOCK lock = SRWLOCK_INIT;
 static __declspec(thread) Fib *left;   /* what this thread last switched away from: not running once the switch is done */
 volatile int rb_keep_fibers;   /* (rollback netplay, SSBU_RB: hle_rb_state.c sets it once a savestate exists) host fibers are never deleted */
+
+/* ... but never deleting them leaks 76 KB (64 KB committed and the guard pages) per fiber the game starts once a
+ * savestate exists, some 0.3 a fight frame, and at a load every host fiber made since the save: a search that loads one state
+ * thousands of times took 0.27 GB a minute (17.9 GB after 40 minutes). A host fiber is needed by a state only when it was its
+ * slot's host fiber at that save: the state was saved after the fiber was made (serial > born) and before it was given up
+ * (serial <= retired). One that no state that still exists can need is deleted where the game without rollback deletes it, and
+ * at a load; the others wait in `graves` until those states are freed. Fib records and guest registers are still never freed (a
+ * host fiber's data points at its record). SSBU_RB_FIBER_FREE=0: as before, all kept. */
+#define RB_ALIVE_MAX 256
+static u64 rb_serial, rb_alive[RB_ALIVE_MAX];   /* savestates made so far; the serials of those that exist */
+static u32 rb_nalive;
+static int rb_fiber_free = -1, rb_untracked;   /* rb_untracked: a state the list could not hold exists: nothing is deleted any more */
+typedef struct Grave { LPVOID host; u64 born, retired; u32 slot; } Grave;
+static Grave *graves;
+static u32 ngraves, graves_cap;
+static u64 rb_fibers_deleted;
+
+static int rb_needed(u64 born, u64 retired) {   /* (lock held) */
+    if (rb_untracked) return 1;
+    for (u32 i = 0; i < rb_nalive; i++) if (rb_alive[i] > born && rb_alive[i] <= retired) return 1;
+    return 0;
+}
+
+/* (lock held) A host fiber nothing runs on and no record holds any more. 1: the caller deletes it once the lock is released. */
+static int rb_retire(LPVOID host, u64 born, u32 slot) {
+    if (rb_fiber_free < 0) { const char *e = getenv("SSBU_RB_FIBER_FREE"); rb_fiber_free = !(e && *e == '0'); }
+    if (!rb_fiber_free || !host) return 0;
+    if (!rb_needed(born, rb_serial)) {
+        rb_fibers_deleted++;
+        if (rb_fibers_deleted >= 1024 && !(rb_fibers_deleted & (rb_fibers_deleted - 1)))   /* (at each power of two) */
+            fprintf(stderr, "[fiber] rollback: %llu host fibers no savestate needs deleted so far (%u wait for a state to be freed)\n", (unsigned long long)rb_fibers_deleted, ngraves);
+        return 1;
+    }
+    if (ngraves == graves_cap) {
+        u32 cap = graves_cap ? graves_cap * 2 : 1024;
+        Grave *g = realloc(graves, sizeof *g * cap);
+        if (!g) return 0;   /* (kept, leaked) */
+        graves = g; graves_cap = cap;
+    }
+    graves[ngraves].host = host; graves[ngraves].born = born; graves[ngraves].retired = rb_serial; graves[ngraves].slot = slot;
+    ngraves++;
+    return 0;
+}
 
 static Fib *by_token(u64 token) {
     if ((token & 0xFFFF000000000000ull) != TOKEN_TAG) return NULL;
@@ -102,7 +146,7 @@ void fiber_rb_census(u32 *live, u32 *running) {
  * fiber is a thread's: its stack is saved with that thread (hle_rb_state.c). */
 #define RB_FIBER_BLOCK 0x500
 typedef struct FSave { Fib f; Cpu cpu; u8 blk[RB_FIBER_BLOCK]; u8 *stack; u64 rsp, n; int lost; } FSave;   /* lost: switched away, its stack not saved */
-typedef struct FSnap { u32 fib_count, nspare; Fib **spare; u64 started, reclaim_at, reclaimed; FSave *v; u64 bytes; } FSnap;
+typedef struct FSnap { u32 fib_count, nspare; Fib **spare; u64 started, reclaim_at, reclaimed; FSave *v; u64 bytes; u64 serial; } FSnap;
 
 /* A fiber block whose host stack (DeallocationStack +0x20 .. StackBase +0x10) holds one of the stack
  * pointers in live[]: some thread runs on that stack now, whatever the fiber's record says (seen:
@@ -117,7 +161,10 @@ static int stack_in_use(const u8 *blk, const u64 *live, u32 nlive) {
 
 void *fiber_rb_save(u64 *bytes, u32 *suspended, const u64 *live, u32 nlive, u32 *in_use) {
     FSnap *s = calloc(1, sizeof *s);
-    AcquireSRWLockShared(&lock);
+    AcquireSRWLockExclusive(&lock);   /* (exclusive: the serial and the records are taken together, see rb_retire) */
+    s->serial = ++rb_serial;
+    if (rb_nalive < RB_ALIVE_MAX) rb_alive[rb_nalive++] = s->serial;
+    else rb_untracked = 1;            /* (more states than the list holds: host fibers are all kept from now on, as before) */
     s->fib_count = fib_count; s->nspare = nspare; s->started = started; s->reclaim_at = reclaim_at; s->reclaimed = reclaimed;
     s->spare = malloc(sizeof *s->spare * (nspare + 1));
     memcpy(s->spare, spare, sizeof *spare * nspare);
@@ -143,7 +190,7 @@ void *fiber_rb_save(u64 *bytes, u32 *suspended, const u64 *live, u32 nlive, u32 
         s->bytes += v->n + RB_FIBER_BLOCK;
         ++*suspended;
     }
-    ReleaseSRWLockShared(&lock);
+    ReleaseSRWLockExclusive(&lock);
     *bytes = s->bytes;
     return s;
 }
@@ -173,7 +220,23 @@ const char *fiber_rb_check(const void *p, const u64 *live, u32 nlive) {
 void fiber_rb_load(const void *p, const u64 *live, u32 nlive, u32 *skipped) {
     const FSnap *s = p;
     *skipped = 0;
+    static LPVOID dead[MAX_FIBERS];   /* (loads never overlap) */
+    u32 ndead = 0;
     AcquireSRWLockExclusive(&lock);
+    /* The host fibers the records of now hold and the save's do not - a slot used again since the save, a slot
+     * made since - are reachable by nothing after this load: given up here (rb_retire), unless a thread is on one. */
+    for (u32 i = 0; i < fib_count; i++) {
+        Fib *f = fibs[i];
+        if (!f->host || !f->guest || f->running || (i < s->fib_count && f->host == s->v[i].f.host)) continue;
+        if (stack_in_use((const u8 *)f->host, live, nlive)) continue;
+        if (rb_retire(f->host, f->born, i)) dead[ndead++] = f->host;
+        if (i >= s->fib_count) f->host = NULL;   /* (its record is not written back below) */
+    }
+    /* A host fiber that waited in `graves` and that this load puts back in its slot's record is in use again. */
+    u32 gkeep = 0;
+    for (u32 i = 0; i < ngraves; i++)
+        if (!(graves[i].slot < s->fib_count && s->v[graves[i].slot].f.host == graves[i].host)) graves[gkeep++] = graves[i];
+    ngraves = gkeep;
     for (u32 i = 0; i < s->fib_count; i++) {
         const FSave *v = &s->v[i];
         Fib *f = fibs[i];
@@ -198,11 +261,25 @@ void fiber_rb_load(const void *p, const u64 *live, u32 nlive, u32 *skipped) {
     fib_count = s->fib_count; nspare = s->nspare; started = s->started; reclaim_at = s->reclaim_at; reclaimed = s->reclaimed;
     memcpy(spare, s->spare, sizeof *spare * nspare);
     ReleaseSRWLockExclusive(&lock);
+    for (u32 i = 0; i < ndead; i++) DeleteFiber(dead[i]);
 }
 
 void fiber_rb_free(void *p) {
     FSnap *s = p;
     if (!s) return;
+    /* This state gone, the host fibers only it could need go too. */
+    AcquireSRWLockExclusive(&lock);
+    for (u32 i = 0; i < rb_nalive; i++) if (rb_alive[i] == s->serial) { rb_alive[i] = rb_alive[--rb_nalive]; break; }
+    u32 keep = 0, ngone = 0;
+    LPVOID *gone = ngraves ? malloc(sizeof *gone * ngraves) : NULL;
+    for (u32 i = 0; i < ngraves; i++) {
+        if (gone && !rb_needed(graves[i].born, graves[i].retired)) { gone[ngone++] = graves[i].host; rb_fibers_deleted++; }
+        else graves[keep++] = graves[i];
+    }
+    ngraves = keep;
+    ReleaseSRWLockExclusive(&lock);
+    for (u32 i = 0; i < ngone; i++) DeleteFiber(gone[i]);
+    free(gone);
     for (u32 i = 0; i < s->fib_count; i++) free(s->v[i].stack);
     free(s->v); free(s->spare); free(s);
 }
@@ -302,7 +379,13 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
     if (fresh) {
         Cpu *n;
         if (next) {
-            if (!rb_keep_fibers) DeleteFiber(next->host);   /* (SSBU_RB: a savestate may need it again; kept, leaked) */
+            if (!rb_keep_fibers) DeleteFiber(next->host);   /* (SSBU_RB: a savestate may need it again) */
+            else {                                           /* (deleted when no state that exists can, see rb_retire) */
+                AcquireSRWLockExclusive(&lock);
+                int del = rb_retire(next->host, next->born, (u32)(next->token & 0xFFFFFFFF));
+                ReleaseSRWLockExclusive(&lock);
+                if (del) DeleteFiber(next->host);
+            }
             n = next->cpu;
         } else {
             n = _aligned_malloc(sizeof *n, 64);
@@ -314,6 +397,7 @@ HLE(_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonES4_) {
         for (int q = 8; q <= 15; q++) memcpy(&n->v[q], P(void, target + 0x70 + 16ull * (q - 8)), 16);
         n->sp = target + FRAME;
         next->guest = load - CONTEXT;
+        next->born = rb_serial;
         next->host = CreateFiberEx(64 << 10, 64 << 20, FIBER_FLAG_FLOAT_SWITCH, fiber_main, next);
         if (!next->host) rt_fatal("cannot create a host fiber (error %lu)", (unsigned long)GetLastError());
     } else {
