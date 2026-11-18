@@ -206,6 +206,11 @@ void gpu_queue_submit(u32 channel, const u64 *entries, u32 count, u32 syncpoint,
     j->fence = fence;
     j->fast = rb_fast > 0;
     j->hide = gpu_hide_fast == 2 ? rb_fast > 1 : j->fast && gpu_hide_fast;   /* (2, a net catch-up: all but its last frame, the one shown) */
+    {   /* SSBU_NO_DRAW=1: no submission draws or clears (state-only runs) */
+        static int no_draw = -1;
+        if (no_draw < 0) { const char *e = getenv("SSBU_NO_DRAW"); no_draw = e && *e == '1'; }
+        if (no_draw) j->hide = 1;
+    }
     j->entries = count <= INLINE ? j->inline_entries : malloc(sizeof *entries * count);
     if (!j->entries) { j->entries = j->inline_entries; j->count = count = 0; }
     memcpy(j->entries, entries, sizeof *entries * count);   /* (the driver reuses its array) */
