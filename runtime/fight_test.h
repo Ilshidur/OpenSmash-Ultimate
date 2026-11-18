@@ -178,7 +178,7 @@ static inline void fixed_fill(uint64_t *state, void *buf, uint64_t size) {
 static inline uint64_t fixed_entropy(uint64_t n, uint64_t sub) { return fixed_mix(fixed_stream(n) + FIXED_GOLDEN * (sub + 1)); }
 
 /* ---- SSBU_DEBUG_MATCH ------------------------------------------------------------------- */
-/* "p1=<fighter>,p2=<fighter>|cpu|human,p3=..,p4=..,c1=<colour>..c4=<colour>,stage=<name>,
+/* "p1=<fighter>|cpu|human,p2=<fighter>|cpu|human,p3=..,p4=..,c1=<colour>..c4=<colour>,stage=<name>,
  * form=omega|battlefield|normal,hazards=on|off,cpu=<level>,items=on|off,stock=<n>,time=<min>"
  * (ssbu-recomp's debug match; c1..c4: a player's costume, 0-7, as ssbu-recomp's c1..c8). A
  * key left out keeps what it was (a list's lines add up); -1: not set. time: the time limit in
@@ -186,11 +186,11 @@ static inline uint64_t fixed_entropy(uint64_t n, uint64_t sub) { return fixed_mi
  * name tag n (1: the list's first slot, 0: none), as if picked on the select screen (#152). */
 typedef struct DebugMatch {
     char name[4][32], stage[48];
-    int p2type, form, hazards, cpu, items, time, stock, colour[4], tag[4];
+    int p1type, p2type, form, hazards, cpu, items, time, stock, colour[4], tag[4];
 } DebugMatch;
 static inline void dm_init(DebugMatch *m) {
     memset(m, 0, sizeof *m);
-    m->p2type = m->form = m->hazards = m->cpu = m->items = m->time = m->stock = -1;
+    m->p1type = m->p2type = m->form = m->hazards = m->cpu = m->items = m->time = m->stock = -1;
     for (int i = 0; i < 4; i++) m->colour[i] = m->tag[i] = -1;
 }
 static inline void dm_parse(DebugMatch *m, const char *text) {
@@ -203,7 +203,8 @@ static inline void dm_parse(DebugMatch *m, const char *text) {
         if (!eq) continue;
         *eq = 0;
         const char *k = t, *v = eq + 1;
-        if (!strcmp(k, "p2") && (!strcmp(v, "cpu") || !strcmp(v, "human"))) m->p2type = !strcmp(v, "cpu");
+        if (!strcmp(k, "p1") && (!strcmp(v, "cpu") || !strcmp(v, "human"))) m->p1type = !strcmp(v, "cpu");
+        else if (!strcmp(k, "p2") && (!strcmp(v, "cpu") || !strcmp(v, "human"))) m->p2type = !strcmp(v, "cpu");
         else if ((k[0] == 'p') && k[1] >= '1' && k[1] <= '4' && !k[2]) snprintf(m->name[k[1] - '1'], sizeof m->name[0], "%s", v);
         else if (k[0] == 'c' && k[1] >= '1' && k[1] <= '4' && !k[2]) m->colour[k[1] - '1'] = atoi(v) & 7;
         else if (!strncmp(k, "tag", 3) && k[3] >= '1' && k[3] <= '4' && !k[4]) { int t = atoi(v); m->tag[k[3] - '1'] = t < 0 || t > 60 ? 0 : t; }   /* (the list has 60 slots) */
@@ -244,6 +245,7 @@ static inline uint32_t dm_player(const DebugMatch *m, int idx, uint8_t *st, uint
     }
     if (idx >= 0 && idx < 2 && m->name[idx][0] && type_was != 3) {
         dm_chara(st, m->name[idx]);
+        if (idx == 0 && m->p1type >= 0) fight_put32(st + 0x78, (uint32_t)m->p1type);   /* (p1=cpu: CPU vs CPU) */
         if (idx == 1 && m->p2type >= 0) fight_put32(st + 0x78, (uint32_t)m->p2type);
         if (m->cpu > 0 && fight_get32(st + 0x78) == 1) { st[0x91] = (uint8_t)m->cpu; fight_put32(st + 0x224, 0xffffffffu); }
     }
