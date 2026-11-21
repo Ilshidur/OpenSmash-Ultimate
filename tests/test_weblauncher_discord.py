@@ -1,7 +1,7 @@
 """tools/weblauncher/discord_account.py: the Discord sign-in the web launcher shares with the game and OpenSmash.exe
 (config/discord_token.txt), checked without Discord: the token file, the application id file, the PKCE sign-in
 against a made-up browser and token endpoint, a refresh, the GSP from the lobbies' game server (signed as
-tools/nex/board.py checks), the choice to show the name on the leaderboard, and the position read from
+the lobby's board.py checks), the choice to show the name on the leaderboard, and the position read from
 leaderboard.json."""
 import base64
 import hashlib
@@ -19,8 +19,11 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'weblauncher'))
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
+sys.path.insert(0, os.path.join(ROOT, 'tests'))
 import discord_account as da  # noqa: E402
-from nex import board  # noqa: E402
+from netproto import HAVE_LOBBY, NO_LOBBY  # noqa: E402
+if HAVE_LOBBY:   # (the game server's own checks, from the lobby server's checkout)
+    from nex import board  # noqa: E402
 
 APP = "123456789012345678"
 
@@ -127,8 +130,9 @@ class SignIn(unittest.TestCase):
             self.assertIsNone(da.current(root, APP, post=refused, user=lambda t: None))
 
 
+@unittest.skipUnless(HAVE_LOBBY, NO_LOBBY)
 class Lobbies(unittest.TestCase):
-    """The GSP and the shown name, against the game server's own checks (tools/nex/board.py)."""
+    """The GSP and the shown name, against the game server's own checks (the lobby server's nex/board.py)."""
 
     def setUp(self):
         d = tempfile.TemporaryDirectory()
@@ -182,14 +186,14 @@ class Lobbies(unittest.TestCase):
         self.assertFalse(self.nex.board.profiles.of_pid[str(pid)]["show"])
         self.assertEqual(self.sent[-1], ("http://a:1/gsp/profile", 200))
 
-    def test_unknown_install_is_registered_with_the_key_once(self):
+    def test_unknown_install_is_not_registered_by_its_key(self):
         self.sent = []
-        del self.nex.accounts.data["users"][self.nsa]       # (the lobby does not know this install)
-        self.nex.board.index(0.0, force=True)
+        del self.nex.accounts.data["users"][self.nsa]       # (the lobby does not know this install: only the game's
+        self.nex.board.index(0.0, force=True)               # own login on its game server makes it known there)
         t = {"user_id": "80351110224678912", "access_token": "AT"}
-        self.assertEqual(da.set_shown(self.root, t, True, ["a:1"], send=self.send), 1)
-        self.assertEqual([c for _u, c in self.sent], [403, 200])
-        self.assertEqual(self.nex.board.profiles.discord_id(self.nex.accounts.data["users"][self.nsa]["pid"]), "80351110224678912")
+        self.assertEqual(da.set_shown(self.root, t, True, ["a:1"], send=self.send), 0)
+        self.assertEqual([c for _u, c in self.sent], [403, 403])
+        self.assertNotIn(self.nsa, self.nex.accounts.data["users"])
 
     def test_refused_token_and_unreachable_lobby(self):
         self.sent = []
@@ -228,6 +232,31 @@ class Lobbies(unittest.TestCase):
         self.assertEqual(da.lobbies("auto"), list(da.PUBLIC_LOBBIES))
         self.assertEqual(da.lobbies("my.host mycode"), list(da.PUBLIC_LOBBIES) + ["my.host:39420"])
         self.assertEqual(da.lobbies(""), list(da.PUBLIC_LOBBIES))
+        # (every region's lobby is asked: a player's records are merged from all of them; the one played on first)
+        self.assertEqual(da.PUBLIC_LOBBIES, ("eu.lobby.opensmashultimate.com:39421", "na.lobby.opensmashultimate.com:39421"))
+        self.assertEqual(da.lobbies("na.lobby.opensmashultimate.com:39421 code"), list(da.PUBLIC_LOBBIES))   # (a region's lobby means the official one)
+        self.assertEqual(da.LEADERBOARD_URL, "http://eu.lobby.opensmashultimate.com:39421/leaderboard.json")
+        for older in ("opensmash-lobby.duckdns.org:39421 code", "smash.recomps.wtf:39421", "na", "eu", da.OFFICIAL_LOBBY):
+            self.assertEqual(da.lobbies(older), list(da.PUBLIC_LOBBIES), older)   # (the older public lobbies mean the official one)
+        os.makedirs(os.path.join(self.root, "config"), exist_ok=True)
+        with open(os.path.join(self.root, "config", "official_lobby.txt"), "w") as f:
+            f.write("lobby.example:39421" + chr(10))
+        try:
+            self.assertEqual(da.lobbies("auto", self.root), ["lobby.example:39421"])   # (the release's lobby)
+            self.assertEqual(da.leaderboard_url(self.root), "http://lobby.example:39421/leaderboard.json")
+        finally:
+            os.remove(os.path.join(self.root, "config", "official_lobby.txt"))
+        # the server region chosen: its lobby first, its leaderboard
+        region = os.path.join(self.root, "config", "server_region.txt")
+        with open(region, "w") as f:
+            f.write("na-east" + chr(10))
+        try:
+            self.assertEqual(da.lobbies("auto", self.root), list(reversed(da.PUBLIC_LOBBIES)))
+            self.assertEqual(da.official_lobby(self.root), "na.lobby.opensmashultimate.com:39421")
+            self.assertEqual(da.leaderboard_url(self.root), "http://na.lobby.opensmashultimate.com:39421/leaderboard.json")
+        finally:
+            os.remove(region)
+        self.assertEqual(da.official_lobby(self.root), da.OFFICIAL_LOBBY)
 
     def test_ranks(self):
         board_json = {"players": [{"rank": 1, "id": "1", "fighters": {"0": {"rank": 3}}},

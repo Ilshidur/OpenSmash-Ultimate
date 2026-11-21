@@ -55,6 +55,7 @@ static class Tests
             Feed().GetAwaiter().GetResult();
             Presence(Path.Combine(root, "presence"));
             ShaderRebuild(Path.Combine(root, "shaders"));
+            UpdateChannel().GetAwaiter().GetResult();
             // (a real SDL3.dll, when one is given: it loads and lists the pads, none needed)
             string? sdl = Environment.GetEnvironmentVariable("LAUNCHER_TEST_SDL_DIR");
             if (!string.IsNullOrEmpty(sdl))
@@ -128,8 +129,10 @@ static class Tests
         string pub = SettingDefaults.PublicLobby;
         var cases = new (string Line, string Lobby, string Back)[]
         {
-            ("", "offline", "off"), ("off", "offline", "off"), ("auto", "auto", "auto"), ("eos", "auto", "auto"), ("na", "auto", "auto"), ("eu", "auto", "auto"),
+            ("", "offline", "off"), ("off", "offline", "off"), ("auto", "auto", "auto"), ("na", "auto", "auto"), ("eu", "auto", "auto"),
             ("smash.recomps.wtf:39421", "auto", "auto"), ("smash.recomps.wtf:39421 mine", "private", pub + " mine"),
+            ("opensmash-lobby.duckdns.org:39421", "auto", "auto"), ("opensmash-lobby.duckdns.org:39421 mine", "private", pub + " mine"),
+            ("eos", "auto", "auto"), ("EOS", "auto", "auto"), ("eos mine", "private", pub + " mine"),   // (Epic Online Services, gone in 0.5.0: the official lobby)
             ("lan", "lan", "lan"), (pub, "auto", "auto"), (pub + " friends", "private", pub + " friends"),
             ("10.0.0.2:39420", "custom", "10.0.0.2:39420"), ("10.0.0.2:39420 abc", "custom", "10.0.0.2:39420 abc"),
         };
@@ -146,6 +149,26 @@ static class Tests
         Check(SettingDefaults.LineFromLobby("custom", "abc", "smash.recomps.wtf:39421") == pub + " abc", "custom smash.recomps.wtf with a code: the private lobby");
         Check(SettingDefaults.LineFromLobby("custom", "", pub) == "auto", "custom with the public lobby's address: auto");
         Check(SettingDefaults.IsOldLobbyLine("smash.recomps.wtf:39421 x") && !SettingDefaults.IsOldLobbyLine("auto") && !SettingDefaults.IsOldLobbyLine(""), "old lobby lines");
+        // the server region: any region's lobby in the file is "the official lobby" (the region setting says which one)
+        foreach (var region in OpenSmash.Core.ServerRegion.All)
+        {
+            Check(SettingDefaults.LobbyFromLine(region.Lobby).Lobby == "auto" && SettingDefaults.LobbyFromLine(region.Lobby + " mine").Lobby == "private", $"{region.Lobby} reads as the official lobby");
+            Check(SettingDefaults.Choices["region"].Contains(region.Id) && SettingDefaults.RegionLabels.Contains(region.Label), $"{region.Id} is a choice of the page");
+        }
+        Check(SettingDefaults.Choices["region"][0] == "auto" && SettingDefaults.Choices["region"].Length == SettingDefaults.RegionLabels.Length && SettingDefaults.OfFile("server_region.txt") == "auto", "Auto first, and the default");
+        string install = Path.Combine(Path.GetTempPath(), "opensmash-region-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(Path.Combine(install, "config"));
+        try
+        {
+            Check(SettingDefaults.RegionShown(install, "auto") == null && SettingDefaults.RegionShown(install, "eu") == null, "Auto not measured, a region chosen: the list's own label");
+            File.WriteAllText(Path.Combine(install, "config", "server_region_auto.txt"), "na-east 23 1700000000\n");
+            Check(SettingDefaults.RegionShown(install, "auto") == "Auto (NA East, 23 ms)" && SettingDefaults.RegionShown(install, "eu") == null, "Auto shown with its pick and ping");
+            File.WriteAllText(Path.Combine(install, "config", "server_region_auto.txt"), "eu\n");
+            Check(SettingDefaults.RegionShown(install, "auto") == "Auto (EU)", "Auto's pick without a time");
+            File.WriteAllText(Path.Combine(install, "config", "official_lobby.txt"), "lobby.example:39421\n");
+            Check(SettingDefaults.RegionShown(install, "auto") == "lobby.example:39421" && SettingDefaults.RegionShown(install, "eu") == "lobby.example:39421", "an install's own official server is shown instead");
+        }
+        finally { try { Directory.Delete(install, true); } catch (IOException) { } }
         Check(SettingDefaults.Renderer("d3d11") == "auto" && SettingDefaults.Renderer("DX11") == "direct3d11" && SettingDefaults.Renderer("vk") == "vulkan", "renderer names as runtime/renderer.h");
     }
 
@@ -356,6 +379,77 @@ static class Tests
         Check(none.StatusText == "no SDL3.dll" && none.Selected == null, "without SDL3.dll the page says why");
     }
 
+    // GitHub's latest release, made up: the API's answer (a status, or no network) and github.com's releases/latest page,
+    // whose redirect lands on the release's tag (or the release list when there is none).
+    sealed class Releases : HttpMessageHandler
+    {
+        public HttpStatusCode Api = HttpStatusCode.OK;
+        public string? ApiTag = "v0.4.1";
+        public bool ApiDown, PageDown;
+        public string PageLands = "/OpenSmash-Ultimate/OpenSmash-Ultimate/releases/tag/v0.4.1";
+        public int PageAsked;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.RequestUri!.Host == "api.github.com")
+            {
+                if (ApiDown) throw new HttpRequestException("no network in tests");
+                var answer = new HttpResponseMessage(Api);
+                if (Api == HttpStatusCode.OK) answer.Content = new StringContent(ApiTag == null ? "{}" : "{\"tag_name\":\"" + ApiTag + "\"}");
+                return Task.FromResult(answer);
+            }
+            PageAsked++;
+            if (PageDown) throw new HttpRequestException("no network in tests");
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = new HttpRequestMessage(request.Method, new Uri("https://github.com" + PageLands)),
+            });
+        }
+    }
+
+    // The update check's release channel and the verdict after an update (Discord "Can't update", 2026-11-18): GitHub not
+    // answering is "not known", never main, and a finished update is not called unfinished for it.
+    static async Task UpdateChannel()
+    {
+        async Task<ProjectSetup.LatestRelease> Ask(Releases r) { using var c = new HttpClient(r); return await ProjectSetup.LatestReleaseAsync(c); }
+        var r = new Releases();
+        var got = await Ask(r);
+        Check(got.Tag == "v0.4.1" && got.Known && r.PageAsked == 0, "release channel: the API's tag");
+        r = new Releases { Api = HttpStatusCode.NotFound };
+        got = await Ask(r);
+        Check(got.Tag == null && got.NoRelease && got.Known, "no release yet (the API's 404): main");
+        r = new Releases { Api = HttpStatusCode.Forbidden };
+        got = await Ask(r);
+        Check(got.Tag == "v0.4.1" && r.PageAsked == 1, "the API's hourly limit: github.com's releases/latest page gives the tag");
+        r = new Releases { ApiDown = true, PageLands = "/OpenSmash-Ultimate/OpenSmash-Ultimate/releases" };
+        got = await Ask(r);
+        Check(got.Tag == null && got.NoRelease, "no network to the API, the page lands on the release list: no release");
+        r = new Releases { Api = HttpStatusCode.Forbidden, PageDown = true };
+        got = await Ask(r);
+        Check(!got.Known && got.Problem.Contains("403"), "neither answers: not known, with the API's reason (" + got.Problem + ")");
+        r = new Releases { ApiTag = null, PageLands = "/OpenSmash-Ultimate/OpenSmash-Ultimate/releases/tag/v0.4.2" };
+        got = await Ask(r);
+        Check(got.Tag == "v0.4.2", "an API answer naming no release: the page");
+        Check(ProjectSetup.ReleaseTagFromPath("/O/R/releases/tag/v1.0%2Bx") == "v1.0+x" && ProjectSetup.ReleaseTagFromPath("/O/R/releases") == null,
+            "the tag of a releases/tag/ address");
+
+        Check(LauncherForm.UpdateRefFor(new ProjectSetup.LatestRelease("v0.4.1", false, ""), out string name) == "v0.4.1" && name == "v0.4.1", "a tag is compared with");
+        Check(LauncherForm.UpdateRefFor(new ProjectSetup.LatestRelease(null, true, ""), out name) == "main" && name == "main", "no release: main");
+        bool threw = false;
+        try { LauncherForm.UpdateRefFor(new ProjectSetup.LatestRelease(null, false, "GitHub answered 403"), out name); }
+        catch (Exception e) { threw = LauncherForm.IsUnavailable(e) && e.Message.Contains("403"); }
+        Check(threw, "not known: the check says it could not check, it never compares with main");
+
+        string sha = new string('e', 40), other = new string('f', 40);
+        string output = "launcher: OpenSmash.exe is now v0.4.1's.\r\n__OPENSMASH_SOURCE__ " + sha + "\r\nThe launcher was updated too: close OpenSmash and open it again.";
+        Check(LauncherForm.InstalledCommit(output) == sha && LauncherForm.InstalledCommit("Nothing to update.") == "", "the updater's proof line");
+        Check(LauncherForm.AfterUpdateVerdict("uptodate", false, "", sha) == LauncherForm.UpdateVerdict.Done, "checked up to date: done");
+        Check(LauncherForm.AfterUpdateVerdict("error", true, output, sha) == LauncherForm.UpdateVerdict.Done, "GitHub not answering, the updater's proof matches the copy: done");
+        Check(LauncherForm.AfterUpdateVerdict("available", false, output, sha) == LauncherForm.UpdateVerdict.Done, "the copy is what the updater installed: done");
+        Check(LauncherForm.AfterUpdateVerdict("error", true, "Updated.", sha) == LauncherForm.UpdateVerdict.Unverified, "GitHub not answering, no proof: not known, not a failure");
+        Check(LauncherForm.AfterUpdateVerdict("error", true, output, other) == LauncherForm.UpdateVerdict.Unverified, "proof of another commit, GitHub not answering: not known");
+        Check(LauncherForm.AfterUpdateVerdict("available", false, "Updated.", sha) == LauncherForm.UpdateVerdict.NotFinished, "GitHub says there is still a newer one: did not finish");
+    }
+
     static async Task Feed()
     {
         const string status = "{\"updated\":\"2026-11-16T13:57:58Z\",\"online\":5,\"rooms\":1,\"arenas\":0,\"open_rooms\":1,\"playing\":0,\"ranked\":78}";
@@ -411,7 +505,32 @@ static class Tests
             using var bmp = new System.Drawing.Bitmap(1280, 720); form.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, 1280, 720));
             bmp.Save(Path.Combine(outDir, name));
         }
+        // (the server region: Auto with a pick kept, as after a start; the home page says whose numbers these are)
+        Directory.CreateDirectory(Path.Combine(repo, "config"));
+        File.WriteAllText(Path.Combine(repo, "config", "server_region_auto.txt"), "eu 24 1700000000\n");
+        File.WriteAllText(Path.Combine(repo, "online_server.txt"), "auto\n");
+        type.GetMethod("RegionView", flags)!.Invoke(form, null);
         Shot("home.png", "home");
+        type.GetMethod("ReadSettings", flags)!.Invoke(form, null);
+        Set("_view", "settings");
+        Set("_settingsTab", Array.FindIndex((Array.ConvertAll((object[])type.GetField("_settingsTabs", flags)!.GetValue(form)!, t => (string)t.GetType().GetField("Name")!.GetValue(t)!)), n => n == "Online"));
+        Shot("settings-online.png", "settings");
+        // (Settings > Storage: the Save disk space row above the buttons, REBUILD SHADERS (#449) beside REFRESH - no two hit
+        // areas may cross; the window keeps 16:9 and draws by its height, so one size says it for all)
+        Set("_settingsTab", Array.FindIndex((Array.ConvertAll((object[])type.GetField("_settingsTabs", flags)!.GetValue(form)!, t => (string)t.GetType().GetField("Name")!.GetValue(t)!)), n => n == "Storage"));
+        Set("_storageText", "dump: 17.2 GB on C:\\OpenSmash\\dump. build: 30.4 GB on C:\\OpenSmash\\build. A long status line, as the real one can be, wraps here.");
+        Shot("settings-storage.png", "settings");
+        var hits = ((System.Collections.IList)type.GetField("_hits", flags)!.GetValue(form)!).Cast<object>().Select(h =>
+        {
+            var ht = h.GetType();
+            float F(string n) => (float)(ht.GetField(n)?.GetValue(h) ?? ht.GetProperty(n)!.GetValue(h)!);
+            return (Id: (string)(ht.GetField("Id")?.GetValue(h) ?? ht.GetProperty("Id")!.GetValue(h)!), R: new System.Drawing.RectangleF(F("X"), F("Y"), F("W"), F("H")));
+        }).Where(h => h.Id.StartsWith("storage:")).ToList();
+        Console.WriteLine("Storage hits: " + string.Join("; ", hits.Select(h => $"{h.Id} {h.R.X:0},{h.R.Y:0} {h.R.Width:0}x{h.R.Height:0}")));
+        Check(hits.Any(h => h.Id == "storage:save_disk") && hits.Any(h => h.Id == "storage:shaders"), "Storage: Save disk space and REBUILD SHADERS both drawn");
+        for (int i = 0; i < hits.Count; i++)
+            for (int j = i + 1; j < hits.Count; j++)
+                Check(!hits[i].R.IntersectsWith(hits[j].R), $"Storage: {hits[i].Id} and {hits[j].Id} do not overlap");
         form.Close();
     }
 

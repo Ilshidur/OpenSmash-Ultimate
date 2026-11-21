@@ -76,7 +76,7 @@ extern u64 gfx_stat_clears, gfx_stat_presented, gfx_stat_blits;   /* (gpu_d3d11.
     X(CmdSetBlendConstants) X(CmdSetStencilReference) X(CmdSetStencilCompareMask) X(CmdSetStencilWriteMask) \
     X(CmdCopyBufferToImage) X(CmdBeginRenderingKHR) X(CmdEndRenderingKHR) X(GetPipelineCacheData) \
     X(CreateComputePipelines) X(CmdDispatch) X(CmdCopyBuffer) X(CreateDescriptorUpdateTemplate) X(UpdateDescriptorSetWithTemplate) \
-    X(DestroyDevice) X(DestroyCommandPool) X(DestroyFence) X(DestroySampler) X(DestroyPipelineCache) X(DestroyPipelineLayout) \
+    X(DestroyDevice) X(DestroyCommandPool) X(DestroyFence) X(DestroySampler) X(DestroyPipelineCache) X(DestroyPipelineLayout) X(DestroyPipeline) \
     X(DestroyDescriptorSetLayout) X(CreateQueryPool) X(DestroyQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
 #define DECLARE(name) static PFN_vk##name vk##name;
 VK_INSTANCE_FUNCS(DECLARE)
@@ -1208,9 +1208,13 @@ static void vk_present(u64 guest, u32 width, u32 height) {
     InterlockedAdd64((volatile LONG64 *)&vk_ns_present, (LONG64)(rt_clock_ns() - t0));
 }
 void hitch_present(void);   /* debug_profile.c (SSBU_HITCH's frame accounting, as gpu_d3d11.c's present) */
+void watchdog_frame(void);   /* debug_watchdog.c (the freeze watchdog's "a frame was shown", without starting it: once the rollback
+                              * code had started it, a Vulkan game that kept drawing wrote freeze reports and minidumps 5, 30 and
+                              * 120 s into every online match; offline it stays off on Vulkan, as before) */
 static void vk_present_(u64 guest, u32 width, u32 height) {
     (void)width; (void)height;
     enter();
+    watchdog_frame();
     hitch_present();
     gfx_stat_presented++;
     if (gfx_stat_presented == 600) trial_passed();   /* (renderer = auto: past its first seconds) */
@@ -2924,7 +2928,7 @@ typedef struct PipeKey {
     VkFormat color[8], depth;
     u32 blend[8][8];           /* enable, colour op, src, dst, alpha op, src, dst; write mask */
 } PipeKey;
-#define PIPE_SLOTS 32768
+#define PIPE_SLOTS 65536   /* (the warm start fills half at most, the draws three quarters: WARM_RECORDS' pipelines and the game's own) */
 typedef struct Pipe {
     Job job;
     PipeKey key;
@@ -3023,7 +3027,7 @@ static VkPipeline get_pipeline(const PipeKey *k, const VShader *vs, const VShade
     AcquireSRWLockExclusive(&pipes_lock);
     for (u32 n = 0; n < PIPE_SLOTS && pipes[h]; n++, h = (h + 1) & (PIPE_SLOTS - 1))
         if (!memcmp(&pipes[h]->key, k, sizeof *k)) { e = pipes[h]; break; }
-    if (!e && npipes < PIPE_SLOTS * 3 / 4 && (e = calloc(1, sizeof *e)) != NULL) {   /* (full: 24,576 pipelines) */
+    if (!e && npipes < PIPE_SLOTS * 3 / 4 && (e = calloc(1, sizeof *e)) != NULL) {   /* (full: 49,152 pipelines) */
         e->key = *k;
         e->job.run = pipe_job;
         e->waited = 1;
@@ -3062,10 +3066,11 @@ static VkPipeline get_pipeline(const PipeKey *k, const VShader *vs, const VShade
  * It is for the SPIR-V files of one translator and one ssbu_glslang.dll (the header says which: another
  * starts the list again, as it makes its SPIR-V again). Records are added as pipelines are made, each
  * with a checksum: a torn or doubled one is left out when the list is read, and the file written again
- * without it. The list holds WARM_RECORDS at most; SSBU_VK_WARM=0 makes nothing from it at the start
- * (it is still kept). */
+ * without it. The list holds WARM_RECORDS at most (the shipped records and the card's own: 32,768 since the shipped list
+ * passed 16,384 with Fountain of Dreams' reflections, #395); SSBU_VK_WARM=0 makes nothing from it at the start (it is
+ * still kept). */
 #define WARM_LIST_VERSION 1   /* (bump when PipeKey's fields change their meaning) */
-#define WARM_RECORDS 16384
+#define WARM_RECORDS 32768   /* (a power of two: warm_seen's slots; PIPE_SLOTS / 2 at most) */
 typedef struct WarmHeader { char magic[8]; u32 record_size, key_size, spv_version, library, list_version, zero; } WarmHeader;
 typedef struct WarmRecord { u32 kind, sum; WarmKey vs, ps; PipeKey key; } WarmRecord;   /* kind 1: a pipeline (key's modules zero); 2: a compute program (vs) */
 static SRWLOCK warm_list_lock = SRWLOCK_INIT;
@@ -3112,7 +3117,9 @@ static int warm_listed(const WarmRecord *r) {
 }
 static void make_note_pipe(const Pipe *e, int made, double ms) {
     vk_play_wait_ms += ms;
+    { void perf_shader_wait(double ms); perf_shader_wait(ms); }   /* (debug_perf_session.c) */
     int listed = -1;
+    u32 sum = 0;
     if (made) {
         vk_stat_play_pipes++;
         if (e->listable) {
@@ -3121,16 +3128,17 @@ static void make_note_pipe(const Pipe *e, int made, double ms) {
             r.kind = 1; r.vs = e->wvs; r.ps = e->wps;
             memcpy(&r.key, &e->key, sizeof r.key);
             r.key.vs = r.key.ps = VK_NULL_HANDLE;
-            r.sum = desc_hash(&r.vs, sizeof r - offsetof(WarmRecord, vs));
+            r.sum = sum = desc_hash(&r.vs, sizeof r - offsetof(WarmRecord, vs));
             listed = warm_listed(&r);
             if (listed) vk_stat_play_pipes_listed++;
         }
     }
     if (!make_log_left()) return;
-    fprintf(stderr, "[vulkan] made in play: pipeline %08x vs %016llx ps %016llx waited %.1f ms (%s; %s) at %.2f s\n", desc_hash(&e->key, sizeof e->key),
-            (unsigned long long)e->wvs.hash, (unsigned long long)e->wps.hash, ms,
+    /* (sum: the record's checksum, as the groups file names it, so a log says which group the pipeline was in) */
+    fprintf(stderr, "[vulkan] made in play: pipeline %08x vs %016llx ps %016llx waited %.1f ms (%s; %s) sum %08x at %.2f s\n",
+            desc_hash(&e->key, sizeof e->key), (unsigned long long)e->wvs.hash, (unsigned long long)e->wps.hash, ms,
             !made ? "warm, being made" : listed < 0 ? "not listable" : listed ? "LISTED" : "not listed",
-            e->state == 1 ? "ready" : e->state == 2 ? "failed" : "not ready: draw skipped", rt_now_ns() / 1e9);
+            e->state == 1 ? "ready" : e->state == 2 ? "failed" : "not ready: draw skipped", sum, rt_now_ns() / 1e9);
 }
 
 static void warm_list_add(WarmRecord *r) {
@@ -3271,36 +3279,76 @@ static void warm_list_open(void) {
 }
 
 /* ---- the warm start's groups --------------------------------------------------------------------------
- * "vulkan_pipelines.groups" (beside the exe, or media/; written by tools/dev/pipeline_sweep.py groups) says what
- * each shipped record is first needed for, by its checksum (WarmRecord.sum), a line per group (lines may repeat):
+ * "vulkan_pipelines.groups" (beside the exe, or media/; written by tools/dev/pipeline_sweep.py groups and assign) says
+ * what each shipped record is first needed for, by its checksum (WarmRecord.sum), a line per group (lines may repeat,
+ * and a record may be in several groups: a costume's pipeline found in a four-fighter match is in each of their groups):
  *   boot <sum> ...                        the title screen and the menus: made before the game's first frame
  *   common <sum> ...                      any fight (its interface, items, the effects every fighter has)
- *   fighter <ui_chara hash40> <sum> ...   that fighter's alone
- *   stage <ui_stage hash40> <sum> ...     that stage's alone
+ *   fighter <ui_chara hash40> <sum> ...   that fighter's
+ *   stage <ui_stage hash40> <sum> ...     that stage's
+ *   maybe <ui_chara hash40> <sum> ...     perhaps that fighter's (a sweep's four-fighter match drew it first): made right
+ *                                         after a match's groups and common, and not waited for (the match would wait for
+ *                                         the other three fighters' too)
+ *   pair <ui_stage hash40> <ui_chara hash40, or 0> <sum> ...   made only when that stage (with that fighter) is played
+ *                                         or picked: Fountain of Dreams' water draws each fighter again, 3,348
+ *                                         pipelines no other stage needs (#395), not made behind the menus for everyone.
+ *                                         (with a fighter: probable, not waited for, as a maybe group)
  * Records in no group (a card's own, what the runs that wrote the file did not draw: 5,662 of the 13,663 in the first
  * file, many of them drawn in the four-player matches of the sweep) are the rest: any match may need them. The first frame
  * waits for the boot group alone; the other groups are made behind the menus, in this order: a match being set up first
- * (the player records' fighters and the stage: gfx_match_want, hle_fight_test.c), then common, then the rest, then every
- * other fighter's and stage's. The match, before it loads, waits for its groups, common and the rest (gfx_match_wait;
- * without the rest, a first fight on a cold driver cache made 85 of them in play, 7.8 s of waits): so the first start shows its title in seconds and still makes no pipeline of
- * its fighters or stage during a fight. While a fight is on, nothing else is made (no CPU taken from the game).
- * Without the file every record is in the boot group: the first frame waits for them all, as before. */
-enum { WG_BOOT, WG_COMMON, WG_FIGHTER, WG_STAGE, WG_REST };
-typedef struct WarmGroup { u64 key; u32 kind, n, cap; u32 *idx; volatile LONG next, done, wanted; } WarmGroup;
-static WarmGroup *warm_groups;   /* [0] boot, [1] common, the fighters' and the stages' in the file's order, last the rest */
+ * (the player records' fighters and the stage, and their pairs: gfx_match_want, hle_fight_test.c), then common, then the
+ * likely ones (the fighters and stages this PC's players picked most, warm_picks; a stage as the stage screen picks it:
+ * gfx_warm_hint), then the rest, then every other fighter's and stage's. The match, before it loads, waits for its groups
+ * and common (gfx_match_wait; not for the rest: #428). So the first start shows its title in seconds and still makes
+ * no pipeline of its fighters or stage during a fight. While a fight is on, only a match's groups are made (no CPU
+ * taken from the game). Without the file every record is in the boot group: the first frame waits for them all, as before. */
+enum { WG_BOOT, WG_COMMON, WG_FIGHTER, WG_STAGE, WG_REST, WG_PAIR, WG_MAYBE };
+typedef struct WarmGroup {
+    u64 key, key2;   /* (the fighter's or stage's hash40; a pair's stage and fighter, 0 for the stage alone) */
+    u32 kind, n, cap;
+    u32 *idx;
+    volatile LONG next, done;
+    volatile LONG wanted;           /* (the want sequence number of the match that wants it; 0: none) */
+    volatile LONG likely;           /* (> 0: made after common, the highest first: picks, the stage screen's choice) */
+    volatile LONG want_a, want_b;   /* (a pair's: the sequence numbers its stage and its fighter were wanted with) */
+} WarmGroup;
+static WarmGroup *warm_groups;   /* [0] boot, [1] common, the fighters', the stages' and the pairs in the file's order, the rest */
 static u32 warm_ngroups, warm_grouped;
 static volatile LONG warm_want_seq, warm_match_seq;   /* (the newest match's groups have wanted >= warm_match_seq) */
+static volatile LONG *warm_taken;   /* (per record: one in several groups is made by the first thread that takes it) */
+static void warm_picks_read(void);
 
-static u32 warm_group_add(u32 kind, u64 key) {
+static u32 warm_group_add(u32 kind, u64 key, u64 key2) {
     for (u32 g = 0; g < warm_ngroups; g++)
-        if (warm_groups[g].kind == kind && warm_groups[g].key == key) return g;
+        if (warm_groups[g].kind == kind && warm_groups[g].key == key && warm_groups[g].key2 == key2) return g;
     WarmGroup *n = realloc(warm_groups, sizeof *n * (warm_ngroups + 1));
     if (!n) return WG_COMMON;
     warm_groups = n;
     memset(&warm_groups[warm_ngroups], 0, sizeof *warm_groups);
     warm_groups[warm_ngroups].kind = kind;
     warm_groups[warm_ngroups].key = key;
+    warm_groups[warm_ngroups].key2 = key2;
     return warm_ngroups++;
+}
+
+/* A group the warm threads take records from: one with records left; a pair only once its stage is played or picked. */
+/* A group the match does not wait for: a fighter's "maybe" one, and a stage pair's with a fighter (Fountain of Dreams' water
+ * drawing each fighter again: 474 records for Mario alone, attributed by the sweep's four-fighter matches; waited for, a
+ * first Fountain match waited 18.0 s instead of 8.4 s on a 32-thread PC and reached the 30 s limit on a slower start).
+ * Made right after the match's groups and common, not during a fight; the stage's own pair (fighter 0) is waited for. */
+static int warm_group_probable(const WarmGroup *g) {
+    return g->kind == WG_MAYBE || (g->kind == WG_PAIR && g->key2);
+}
+
+static int warm_group_open(const WarmGroup *g) {
+    return g->next < (LONG)g->n && (g->kind != WG_PAIR || g->wanted || g->likely);
+}
+
+typedef struct SumGroup { u32 sum, group; } SumGroup;
+static int sum_group_order(const void *a, const void *b) {
+    const SumGroup *x = a, *y = b;
+    if (x->sum != y->sum) return x->sum < y->sum ? -1 : 1;
+    return x->group < y->group ? -1 : x->group > y->group;
 }
 
 static void warm_groups_open(void) {
@@ -3325,15 +3373,14 @@ static void warm_groups_open(void) {
         if (t) { text = t; text[size] = 0; }
         else { free(text); text = NULL; }
     }
-    /* the sums, by open addressing: sum -> group */
-    u32 slots = 1u << 16;
-    while (slots < warm_nrecords * 4) slots <<= 1;
-    u32 *sum_at = text ? calloc(slots, sizeof *sum_at) : NULL, *group_at = sum_at ? calloc(slots, sizeof *group_at) : NULL;
-    u32 nsums = 0;
-    if (group_at) {
+    /* the (sum, group) pairs, sorted by sum: a record's groups are a run of them */
+    SumGroup *sg = NULL;
+    size_t nsg = 0, capsg = 0;
+    int have = text != NULL;
+    if (text) {
         char *end = text + size, *p = text;
         u32 group = WG_BOOT;
-        while (p < end) {
+        while (p < end && have) {
             char *line = p;
             while (p < end && *p != '\n') p++;
             char *eol = p;
@@ -3345,54 +3392,79 @@ static void warm_groups_open(void) {
             if (!t) continue;
             if (!strcmp(t, "boot")) group = WG_BOOT;
             else if (!strcmp(t, "common")) group = WG_COMMON;
-            else if (!strcmp(t, "fighter") || !strcmp(t, "stage")) {
+            else if (!strcmp(t, "fighter") || !strcmp(t, "stage") || !strcmp(t, "maybe")) {
                 char *k2 = strtok(NULL, " \t");
                 if (!k2) continue;
-                group = warm_group_add(t[0] == 'f' ? WG_FIGHTER : WG_STAGE, strtoull(k2, NULL, 16));
+                group = warm_group_add(t[0] == 'f' ? WG_FIGHTER : t[0] == 's' ? WG_STAGE : WG_MAYBE, strtoull(k2, NULL, 16), 0);
+            } else if (!strcmp(t, "pair")) {
+                char *ks = strtok(NULL, " \t"), *kf = ks ? strtok(NULL, " \t") : NULL;
+                if (!kf) continue;
+                group = warm_group_add(WG_PAIR, strtoull(ks, NULL, 16), strtoull(kf, NULL, 16));
             } else continue;   /* (a kind of line this build does not know) */
             for (char *s; (s = strtok(NULL, " \t")) != NULL;) {
                 u32 sum = (u32)strtoul(s, NULL, 16);
-                if (!sum || nsums >= slots / 2) continue;
-                u32 at = (sum * 2654435761u) & (slots - 1);
-                while (sum_at[at] && sum_at[at] != sum) at = (at + 1) & (slots - 1);
-                if (!sum_at[at]) { sum_at[at] = sum; group_at[at] = group; nsums++; }
+                if (!sum) continue;
+                if (nsg == capsg) {
+                    SumGroup *more = realloc(sg, sizeof *sg * (capsg = capsg * 2 + 4096));
+                    if (!more) { have = 0; break; }
+                    sg = more;
+                }
+                sg[nsg].sum = sum;
+                sg[nsg++].group = group;
             }
         }
     }
-    int have = text && group_at;
     free(text);
-    u32 rest = have ? warm_group_add(WG_REST, 0) : WG_BOOT;   /* (no file: everything in the boot group) */
-    u32 *of = malloc(sizeof *of * (warm_nrecords ? warm_nrecords : 1));
-    if (!of) { warm_ngroups = 0; free(sum_at); free(group_at); free(warm_groups); warm_groups = NULL; return; }
-    for (u32 i = 0; i < warm_nrecords; i++) {
-        u32 g = rest, sum = warm_records[i].sum;
-        if (group_at && sum) {
-            for (u32 at = (sum * 2654435761u) & (slots - 1); sum_at[at]; at = (at + 1) & (slots - 1))
-                if (sum_at[at] == sum) { g = group_at[at]; break; }
+    if (have && nsg) qsort(sg, nsg, sizeof *sg, sum_group_order);
+    u32 rest = have ? warm_group_add(WG_REST, 0, 0) : WG_BOOT;   /* (no file: everything in the boot group) */
+    warm_taken = calloc(warm_nrecords ? warm_nrecords : 1, sizeof *warm_taken);
+    if (!warm_taken) { warm_ngroups = 0; free(sg); free(warm_groups); warm_groups = NULL; return; }
+    /* each record's run of pairs, twice: the groups' sizes, then their records */
+    for (int pass = 0; pass < 2; pass++) {
+        for (u32 i = 0; i < warm_nrecords; i++) {
+            u32 sum = warm_records[i].sum;
+            size_t lo = 0, hi = have ? nsg : 0;
+            while (lo < hi) {   /* (the first pair of this sum) */
+                size_t mid = lo + (hi - lo) / 2;
+                if (sg[mid].sum < sum) lo = mid + 1;
+                else hi = mid;
+            }
+            int any = 0;
+            for (size_t j = lo; have && sum && j < nsg && sg[j].sum == sum; j++) {
+                if (j > lo && sg[j].group == sg[j - 1].group) continue;   /* (a line repeated) */
+                WarmGroup *g = &warm_groups[sg[j].group];
+                if (!pass) g->n++;
+                else if (g->n < g->cap) g->idx[g->n++] = i;
+                any = 1;
+            }
+            if (!any) {
+                WarmGroup *g = &warm_groups[rest];
+                if (!pass) g->n++;
+                else if (g->n < g->cap) g->idx[g->n++] = i;
+            } else if (!pass) warm_grouped++;
         }
-        of[i] = g;
-        warm_groups[g].n++;
-        if (g != rest) warm_grouped++;
+        if (!pass)
+            for (u32 g = 0; g < warm_ngroups; g++) {
+                warm_groups[g].idx = malloc(sizeof(u32) * (warm_groups[g].n ? warm_groups[g].n : 1));
+                warm_groups[g].cap = warm_groups[g].idx ? warm_groups[g].n : 0;   /* (no memory: an empty group) */
+                warm_groups[g].n = 0;   /* (counted again as they are put in) */
+            }
     }
-    for (u32 g = 0; g < warm_ngroups; g++) {
-        warm_groups[g].idx = malloc(sizeof(u32) * (warm_groups[g].n ? warm_groups[g].n : 1));
-        warm_groups[g].cap = warm_groups[g].n;
-        warm_groups[g].n = 0;
-    }
-    for (u32 i = 0; i < warm_nrecords; i++) {
-        WarmGroup *g = &warm_groups[of[i]];
-        if (g->idx) g->idx[g->n++] = i;
-    }
-    free(of);
-    free(sum_at);
-    free(group_at);
+    free(sg);
     if (rest != WG_BOOT) {
-        u32 nf = 0, ns = 0;
-        for (u32 g = 2; g < warm_ngroups; g++) nf += warm_groups[g].kind == WG_FIGHTER, ns += warm_groups[g].kind == WG_STAGE;
-        fprintf(stderr, "[vulkan] warm start: %u of %u records in groups (%s): %u for the menus first, %u for any fight, %u fighters, %u stages; "
-                "%u in no group, made last\n", warm_grouped, warm_nrecords, path, warm_groups[WG_BOOT].n,
-                warm_groups[WG_COMMON].n, nf, ns, warm_groups[rest].n);
+        u32 nf = 0, ns = 0, np = 0, pr = 0, fr = 0, sr = 0, mr = 0;
+        for (u32 g = 2; g < warm_ngroups; g++) {
+            const WarmGroup *w = &warm_groups[g];
+            if (w->kind == WG_FIGHTER) { nf++; fr += w->n; }
+            if (w->kind == WG_STAGE) { ns++; sr += w->n; }
+            if (w->kind == WG_MAYBE) mr += w->n;
+            if (w->kind == WG_PAIR) { np++; pr += w->n; }
+        }
+        fprintf(stderr, "[vulkan] warm start: %u of %u records in groups (%s): %u for the menus first, %u for any fight, %u fighters' (%u, and %u "
+                "perhaps theirs), %u stages' (%u), %u stage pairs (%u, made only when their stage is played or picked); %u in no group, made last\n",
+                warm_grouped, warm_nrecords, path, warm_groups[WG_BOOT].n, warm_groups[WG_COMMON].n, nf, fr, mr, ns, sr, np, pr, warm_groups[rest].n);
     }
+    warm_picks_read();
 }
 
 /* ---- the warm start: the list's pipelines made before the game asks for them ------------------------------- */
@@ -3432,17 +3504,84 @@ static volatile LONG prep_state;   /* 0 not started, 1 running, 2 done */
 static char prep_note[96];
 void watchdog_pause(int on);   /* (debug_watchdog.c) */
 
-/* The cache says SPIR-V for this translator is prepared (tools/shader_aot.py's "spirv g<version>.<library>" line). */
-static int shader_cache_prepared(void) {
-    char path[1200], want[48], line[256];
-    snprintf(path, sizeof path, "%s/complete.txt", cache_dir());
+/* One preparation for the launcher and the game (SSBU_SHADER_SHARE=0: each by itself, as before). The launcher runs
+ * the same tool in the background, and it wrote complete.txt only after Direct3D 11's shaders, an hour after the
+ * SPIR-V this back end reads: a game started meanwhile began a second run of the tool on the same cache and waited
+ * for all of it. Now (tools/shader_aot.py, "one preparation at a time"):
+ * - vulkan_ready.txt is written as soon as the SPIR-V is made, and counts here as complete.txt's spirv line does;
+ * - while a run of the tool holds prepare.lock and is still making the SPIR-V, this start waits for that run and
+ *   shows its progress (the lock's "list N" / "vulkan N" line) instead of starting its own; it holds
+ *   game_waits.lock meanwhile, which tells that run not to pause for this game;
+ * - a run this game starts makes the SPIR-V only; the driver's pipelines and Direct3D 11's are the launcher's. */
+static int prep_shared(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SSBU_SHADER_SHARE"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static int prep_marker_says(const char *name, const char *want) {
+    char path[1200], line[256];
+    snprintf(path, sizeof path, "%s/%s", cache_dir(), name);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    snprintf(want, sizeof want, "g%d.%08x", SHADER_CACHE_SPV_VERSION, spirv_glslang_version());
     int ok = 0;
     while (!ok && fgets(line, sizeof line, f)) ok = !strncmp(line, "spirv ", 6) && strstr(line + 6, want) != NULL;
     fclose(f);
     return ok;
+}
+
+/* The cache says SPIR-V for this translator is prepared (tools/shader_aot.py's "spirv g<version>.<library>" line,
+ * in complete.txt, or in vulkan_ready.txt: the SPIR-V is all there, Direct3D 11's shaders may still be being made). */
+static int shader_cache_prepared(void) {
+    char want[48];
+    snprintf(want, sizeof want, "g%d.%08x", SHADER_CACHE_SPV_VERSION, spirv_glslang_version());
+    if (prep_marker_says("complete.txt", want)) return 1;
+    return prep_shared() && prep_marker_says("vulkan_ready.txt", want);
+}
+
+/* Another run of the tool holds prepare.lock (the launcher's background one, or another game's): 1 and its line.
+ * The holder shares reading only, so the file can be removed exactly when nobody holds it (one left by a power cut). */
+static int prep_other(char *rec, size_t size) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/prepare.lock", cache_dir());
+    rec[0] = 0;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION;
+    DWORD got = 0;
+    if (!ReadFile(h, rec, (DWORD)size - 1, &got, NULL)) got = 0;
+    rec[got] = 0;
+    CloseHandle(h);
+    return !DeleteFileA(path);
+}
+
+/* game_waits.lock, held while this start waits for the shaders (it goes with the handle, or with the process). */
+static HANDLE prep_waits_open(void) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s/game_waits.lock", cache_dir());
+    return CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+}
+
+static void prep_share(int pct);
+/* Waits for the run that holds prepare.lock while it makes the SPIR-V, with its progress on the loading screen.
+ * 1: the cache is prepared; 0: no run holds the lock (this start runs the tool itself); -1: a run holds it and makes
+ * no SPIR-V (or has failed to): not waited for, and no second run beside it. */
+static int prep_follow(HANDLE *waits) {
+    char rec[80];
+    int said = 0, pct;
+    for (;;) {
+        if (shader_cache_prepared()) return 1;
+        if (!prep_other(rec, sizeof rec)) return shader_cache_prepared() ? 1 : 0;
+        if (*waits == INVALID_HANDLE_VALUE) *waits = prep_waits_open();   /* (another waiting game may hold it: asked again) */
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "[vulkan] preparing shaders: a preparation is already running (the launcher's): waiting for its "
+                            "Vulkan part instead of starting a second one\n");
+        }
+        if (sscanf(rec, "list %d", &pct) == 1) prep_share(pct / 10);
+        else if (sscanf(rec, "vulkan %d", &pct) == 1) prep_share(10 + pct * 89 / 100);
+        else if (!strncmp(rec, "rest", 4)) return shader_cache_prepared() ? 1 : -1;
+        Sleep(250);
+    }
 }
 
 /* "<root>\tools\shader_aot.py" for the folder the game runs in (the repository: the launcher and Play SSBU.bat
@@ -3603,10 +3742,17 @@ static DWORD WINAPI prep_main(void *arg) {
     char root[1200];
     (void)arg;
     watchdog_pause(1);
-    if (prep_tool(root, sizeof root)) {
+    HANDLE waits = INVALID_HANDLE_VALUE;
+    int other = prep_shared() ? prep_follow(&waits) : 0;
+    if (other > 0) fprintf(stderr, "[vulkan] preparing shaders: the cache is ready (prepared by the run that was going on)\n");
+    else if (other < 0) fprintf(stderr, "[vulkan] preparing shaders: the preparation that is running makes no Vulkan shaders; "
+                                        "the game translates each program at its first use\n");
+    else if (prep_tool(root, sizeof root)) {
+        if (prep_shared() && waits == INVALID_HANDLE_VALUE) waits = prep_waits_open();
         prep_tries(1);
         if (prep_run(root)) prep_tries(-1);
     } else fprintf(stderr, "[vulkan] preparing shaders: tools\\shader_aot.py is not here, so the game translates each program at its first use\n");
+    if (waits != INVALID_HANDLE_VALUE) CloseHandle(waits);
     display_loading_note(NULL);
     InterlockedExchange(&prep_state, 2);
     watchdog_pause(0);
@@ -3717,6 +3863,7 @@ static char warm_capped[1200];   /* "<list>.capped": this card's driver crashed 
 static int warm_tries;   /* (what the marker says while the warm threads run) */
 extern void (*rt_crash_module_hook)(const char *module);   /* host.c: called with the faulting module's name */
 
+static int vk_warm_only(void);   /* (SSBU_VK_WARM_ONLY: below, with the shader loading) */
 /* The crash handler's report thread, while the process dies: a crash inside a graphics driver's shader compiler during
  * the warm start is written into the marker ("<n> driver <dll>"), so the next start does not warm the same list into
  * the same crash (warm_start). The same driver crash with no warm start running is written down as a lost device
@@ -3775,8 +3922,13 @@ static void warm_one(u32 i) {
         put = 1;
     }
     ReleaseSRWLockExclusive(&pipes_lock);
-    if (put) pipe_make(e);
-    else {
+    if (put) {
+        pipe_make(e);
+        if (vk_warm_only() && e->state == 1 && e->pipe) {   /* (only for the driver's cache: given back, no memory budget) */
+            vkDestroyPipeline(device, e->pipe, NULL);
+            e->pipe = VK_NULL_HANDLE;
+        }
+    } else {
         free(e);
         if (found) InterlockedIncrement(&warm_found);   /* (the game drew with it first: made by a draw) */
         else { InterlockedIncrement(&warm_left); InterlockedIncrement(&warm_left_full); }
@@ -3788,54 +3940,105 @@ static LONG warm_take(WarmGroup *g) {
     LONG k = InterlockedIncrement(&g->next) - 1;
     return k < (LONG)g->n ? (LONG)g->idx[k] : -1;
 }
-/* The next record to make, and its group: the boot group's, the newest match's groups', common's, then (no fight on)
- * the others'. -1: none now (a fight is on, and only other groups' are left); -2: none left. */
+/* The next record to make, and its group: the boot group's, the newest match's groups', common's, then (no fight on) the
+ * match's "maybe" ones', the likely ones', the rest's and the others'. -1: none now (a fight is on, and only other groups'
+ * are left); -2: none left (a pair not played or picked is not left: it waits for its stage, vk_match_want, which starts
+ * the threads again). (The maybe groups not during a fight either: a Captain Falcon - Mario match made Mario's 379 in its
+ * first seconds, two frames of 27 and 37 ms.) */
 static LONG warm_next(u32 *group) {
     LONG i;
     if ((i = warm_take(&warm_groups[WG_BOOT])) >= 0) { *group = WG_BOOT; return i; }
-    for (;;) {   /* (the groups a match wants, the newest first) */
+    int fight = !warm_urgent && game_fight_on();
+    for (int maybe = 0; maybe < 2 - fight; maybe++) {   /* (the groups a match wants, the newest first; its "maybe" ones after common) */
+        if (maybe && (i = warm_take(&warm_groups[WG_COMMON])) >= 0) { *group = WG_COMMON; return i; }
+        for (;;) {
+            u32 best = 0;
+            LONG bw = 0;
+            for (u32 g = 2; g < warm_ngroups; g++)
+                if (warm_group_probable(&warm_groups[g]) == maybe && warm_groups[g].wanted > bw && warm_groups[g].next < (LONG)warm_groups[g].n) {
+                    best = g;
+                    bw = warm_groups[g].wanted;
+                }
+            if (!bw) break;
+            if ((i = warm_take(&warm_groups[best])) >= 0) { *group = best; return i; }
+        }
+    }
+    if ((i = warm_take(&warm_groups[WG_COMMON])) >= 0) { *group = WG_COMMON; return i; }   /* (in a fight too, as before) */
+    for (; !fight;) {   /* (the likely ones: a stage the stage screen picked, then the fighters and stages picked most) */
         u32 best = 0;
-        LONG bw = 0;
+        LONG bl = 0;
         for (u32 g = 2; g < warm_ngroups; g++)
-            if (warm_groups[g].wanted > bw && warm_groups[g].next < (LONG)warm_groups[g].n) { best = g; bw = warm_groups[g].wanted; }
-        if (!bw) break;
+            if (warm_groups[g].likely > bl && warm_groups[g].next < (LONG)warm_groups[g].n) { best = g; bl = warm_groups[g].likely; }
+        if (!bl) break;
         if ((i = warm_take(&warm_groups[best])) >= 0) { *group = best; return i; }
     }
-    if ((i = warm_take(&warm_groups[WG_COMMON])) >= 0) { *group = WG_COMMON; return i; }
     /* (The records in no group come next, with the other fighters' and stages': not while a fight is on, and no match
      * waits for them. A match used to: on a Radeon 760M with the whole SPIR-V cache prepared that was 5,509 pipelines,
      * the 120 s limit, the game frozen before the stage loaded - #428.) */
-    for (u32 g = 2; g < warm_ngroups; g++)
-        if (warm_groups[g].kind == WG_REST && !(!warm_urgent && game_fight_on()) && (i = warm_take(&warm_groups[g])) >= 0) { *group = g; return i; }
+    for (u32 g = 2; g < warm_ngroups && !fight; g++)
+        if (warm_groups[g].kind == WG_REST && (i = warm_take(&warm_groups[g])) >= 0) { *group = g; return i; }
     int left = 0;
-    for (u32 g = 2; g < warm_ngroups && !left; g++) left = warm_groups[g].next < (LONG)warm_groups[g].n;
+    for (u32 g = 2; g < warm_ngroups && !left; g++) left = warm_group_open(&warm_groups[g]);
     if (!left) return -2;
-    if (!warm_urgent && game_fight_on()) return -1;
+    if (fight) return -1;
     for (u32 g = 2; g < warm_ngroups; g++)
-        if ((i = warm_take(&warm_groups[g])) >= 0) { *group = g; return i; }
+        if (warm_group_open(&warm_groups[g]) && (i = warm_take(&warm_groups[g])) >= 0) { *group = g; return i; }
     return -1;
 }
 
+static int warm_work_left(void) {
+    for (u32 g = 0; g < warm_ngroups; g++)
+        if (warm_group_open(&warm_groups[g])) return 1;
+    return 0;
+}
+
+/* (the threads that work behind the menus too, not only while something waits for the list: an id below warm_threads_bg,
+ * or a resting one that took over when none of those was left, so a pair wanted later is made without a wait) */
+static volatile LONG warm_workers;
+static SRWLOCK warm_marker_lock = SRWLOCK_INIT;   /* (the last thread out deletes the marker, a restart writes it: one at a time) */
+
 static DWORD WINAPI warm_main(void *arg) {
     u32 id = (u32)(uintptr_t)arg;
+    int worker = id < warm_threads_bg;
+again:
     for (;;) {
-        if (id >= (warm_urgent ? warm_threads_all : warm_threads_bg)) {   /* (this thread rests: nothing waits for the list) */
+        if (!worker && id >= (warm_urgent ? warm_threads_all : warm_threads_bg)) {   /* (this thread rests: nothing waits for the list) */
             Sleep(25);
-            int left = 0;
-            for (u32 g = 0; g < warm_ngroups && !left; g++) left = warm_groups[g].next < (LONG)warm_groups[g].n;
-            if (!left) break;
+            if (!warm_work_left()) break;
+            if (!warm_workers && InterlockedCompareExchange(&warm_workers, 1, 0) == 0) worker = 1;   /* (no worker left: this one) */
             continue;
         }
         u32 g = 0;
         LONG i = warm_next(&g);
         if (i == -2) break;
         if (i == -1) { Sleep(25); continue; }
-        warm_one((u32)i);
+        /* (warm_taken: 0 free, 1 being made, 2 made. A record in another group too, taken there first, counts as done here
+         * once it is made: a match does not stop waiting while its pipeline is still being compiled) */
+        if (!InterlockedCompareExchange(&warm_taken[i], 1, 0)) {
+            warm_one((u32)i);
+            InterlockedExchange(&warm_taken[i], 2);
+            InterlockedIncrement(&warm_ndone);   /* (records, once each) */
+        } else
+            while (warm_taken[i] == 1) Sleep(1);
         InterlockedIncrement(&warm_groups[g].done);
-        InterlockedIncrement(&warm_ndone);
     }
+    if (worker) { InterlockedDecrement(&warm_workers); worker = 0; }
     if (!InterlockedDecrement(&warm_running)) {
-        DeleteFileA(warm_marker);
+        /* (the last one out: a pair wanted since this thread found nothing left is made by it - vk_match_want saw threads
+         * still running, so it started none; or warm_wake has just started others, which then own the marker) */
+        if (warm_work_left()) {
+            if (InterlockedCompareExchange(&warm_running, 1, 0) == 0) {
+                InterlockedIncrement(&warm_workers);
+                worker = 1;
+                goto again;
+            }
+            return 0;
+        }
+        AcquireSRWLockExclusive(&warm_marker_lock);   /* (not after warm_wake has written it again for its threads) */
+        int restarted = warm_running != 0;
+        if (!restarted) DeleteFileA(warm_marker);
+        ReleaseSRWLockExclusive(&warm_marker_lock);
+        if (restarted) return 0;
         fprintf(stderr, "[vulkan] warm start: %lld programs loaded and %lld pipelines made of %u listed in %.1f s (%ld left out%s; at %.1f s)\n",
                 (long long)vk_stat_warm_loaded, (long long)vk_stat_warm_pipelines, warm_nrecords, (rt_clock_ns() - warm_t0) / 1e9, (long)warm_left,
                 warm_stopped ? ": the memory budget, SSBU_SHADER_PREWARM_MB" : "", rt_now_ns() / 1e9);
@@ -3847,6 +4050,39 @@ static DWORD WINAPI warm_main(void *arg) {
     return 0;
 }
 
+/* The warm threads started: warm_running set to n by the caller (from 0), the marker written (a driver crash in them is
+ * noted there: warm_crash_note). Below the makers' priority. */
+static void warm_threads_go(u32 n, int first) {
+    AcquireSRWLockExclusive(&warm_marker_lock);
+    FILE *mark = fopen(warm_marker, "wb");
+    if (mark) { fprintf(mark, "%d", warm_tries + 1); fclose(mark); }
+    ReleaseSRWLockExclusive(&warm_marker_lock);
+    if (!mark) fprintf(stderr, "[vulkan] warm start: no marker file (%s): one that does not finish will not be noticed\n", warm_marker);
+    for (u32 i = 0; i < n; i++) {
+        if (i < warm_threads_bg) InterlockedIncrement(&warm_workers);
+        HANDLE t = CreateThread(NULL, 64ull << 20, warm_main, (void *)(uintptr_t)i, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (!t) {
+            if (i < warm_threads_bg) InterlockedDecrement(&warm_workers);
+            if (!InterlockedDecrement(&warm_running)) {   /* (no thread at all: at the start, nothing is loaded) */
+                if (first) warm_shader_slots = 0;
+                DeleteFileA(warm_marker);
+            }
+            continue;
+        }
+        SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(t);
+    }
+}
+
+/* A group wanted after the warm threads ended (a pair: Fountain of Dreams picked late in a session): they start again.
+ * (Threads still running take it themselves: the workers, or a resting one when no worker is left.) */
+static void warm_wake(void) {
+    if (!warm_ngroups || warm_running || warm_stopped || !warm_work_left()) return;
+    if (InterlockedCompareExchange(&warm_running, (LONG)warm_threads_all, 0) != 0) return;
+    fprintf(stderr, "[vulkan] warm start: started again for a stage's pipelines\n");
+    warm_threads_go(warm_threads_all, 0);
+}
+
 /* ---- the shader loading: the first present waits for the warm start ----------------------------------------
  * As a PC game compiles its pipelines behind a loading screen: the boot group's pipelines (the menus'; every record
  * without a groups file) are made before the game's first frame, with "Shaders N%" beside the loading animation,
@@ -3855,7 +4091,45 @@ static DWORD WINAPI warm_main(void *arg) {
  * wait; N: N seconds at most (as Direct3D 11's). */
 void watchdog_pause(int on);   /* debug_watchdog.c */
 static int warm_group_left(const WarmGroup *g) { return g->done < (LONG)g->n; }
+static void pipeline_cache_save(void);
+/* SSBU_VK_WARM_ONLY=1 (tools/shader_aot.py, after Prepare Shaders has every SPIR-V file; with SSBU_HEADLESS=1): this
+ * start only fills the graphics driver's own pipeline cache, then ends. The driver keeps its compiled pipelines by the
+ * program's path (gpu_nvcache.c), so a new install's first starts compiled them while the player waited: 18 s before the
+ * first frame, up to 120 s before each of the first matches, and whatever the memory budget left out at its first draw
+ * (measured 2026-11-17, RTX 2080 SUPER: 7,900 pipelines in 150 s on 10 threads, 5,600 never made). Here every listed
+ * pipeline is made once, no memory budget (each is given back at once: the driver's cache has it), all threads; a game
+ * started meanwhile ends this at once (it holds GAME_RUNNING), and what was made stays made. The same exe at the same
+ * path then finds them in milliseconds. */
+#define GAME_RUNNING "Local\\ssbu-game-running"   /* (gpu_d3d11.c's WARM_GAME; tools/shader_aot.py pauses for it) */
+static int vk_warm_only(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SSBU_VK_WARM_ONLY"); v = e && *e == '1'; }
+    return v;
+}
+static void vk_warm_only_run(void) {
+    u64 t0 = GetTickCount64();
+    int stopped = 0;
+    watchdog_pause(1);
+    while (warm_running && !stopped) {
+        HANDLE g = OpenMutexA(SYNCHRONIZE, FALSE, GAME_RUNNING);
+        if (g) { CloseHandle(g); stopped = 1; break; }
+        static u64 said;
+        if (GetTickCount64() - said >= 2000) {   /* (tools/shader_aot.py's bar reads these) */
+            said = GetTickCount64();
+            fprintf(stderr, "[vulkan] warm only: %ld of %u\n", (long)warm_ndone, warm_nrecords);
+            fflush(stderr);
+        }
+        Sleep(100);
+    }
+    if (!stopped) pipeline_cache_save();
+    fprintf(stderr, "[vulkan] warm only: %lld pipelines made and %lld programs loaded of %u listed in %.1f s (%lld the driver could not make)%s\n",
+            (long long)vk_stat_warm_pipelines, (long long)vk_stat_warm_loaded, warm_nrecords, (GetTickCount64() - t0) / 1000.0,
+            (long long)vk_stat_pipeline_failures, stopped ? "; stopped: the game was started" : "");
+    fflush(stderr);
+    ExitProcess(stopped ? 3 : 0);
+}
 static void vk_warm_gate(void) {
+    if (vk_warm_only()) vk_warm_only_run();
     const char *set = getenv("SSBU_SHADER_PREWARM_WAIT");
     double limit_s = set && *set ? atof(set) : 0;
     prepare_wait();   /* (the loading screen shows "Preparing shaders N%" while a cold cache is made) */
@@ -3883,20 +4157,154 @@ static void vk_warm_gate(void) {
             (long long)vk_stat_warm_pipelines, warm_nrecords, warm_threads_all, warm_threads_bg);
 }
 
-/* ---- a match's groups (gfx_match_want, gfx_match_wait: hle_fight_test.c) ------------------------------------- */
+/* ---- a match's groups (gfx_match_want, gfx_match_wait, gfx_warm_hint: hle_fight_test.c) ---------------------- */
+/* The likely groups. "<shader cache>/warm_picks.txt" counts the fighters (human players') and stages this PC's matches were
+ * set up with (a line each, "<hash40> <count>", the most played first, WARM_PICKS at most): at the next start their groups
+ * are made right after common, the most played first - a first start of a new build, or after a driver update, has the
+ * player's own fighters ready by the time the menus are passed, not in the order of the file. And the stage screen's choice
+ * (gfx_warm_hint: hle_fight_test.c reads it at each frame end) goes before them: a stage known some seconds before the match
+ * is set up. */
+#define WARM_PICKS 64
+#define WARM_HINT 0x1000000   /* (a stage screen's choice: above any count of picks) */
+typedef struct WarmPick { u64 key; u32 count; } WarmPick;
+static WarmPick warm_picks[WARM_PICKS];
+static u32 warm_npicks;
+static u64 warm_pending[9];   /* (this match's: its human players' fighters and its stage, counted as it is waited for) */
+static u32 warm_npending;
+static SRWLOCK warm_picks_lock = SRWLOCK_INIT;
+
+static void warm_picks_path(char *path, size_t size) { snprintf(path, size, "%s/warm_picks.txt", cache_dir()); }
+
+/* (warm_groups_open: the groups of the fighters and stages played before made after common, the most played first) */
+static int warm_picks_on;   /* (the file read, or found missing: a match's picks are counted on top of it) */
+static void warm_picks_read(void) {
+    char path[1200], line[128];
+    const char *headless = getenv("SSBU_HEADLESS");
+    warm_picks_on = !(headless && !strcmp(headless, "1"));   /* (test runs read it, but count nothing: they share a player's cache) */
+    warm_picks_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    u32 n = 0, groups = 0;
+    while (n < WARM_PICKS && fgets(line, sizeof line, f)) {
+        unsigned long long key;
+        unsigned count;
+        if (line[0] == '#' || sscanf(line, "%llx %u", &key, &count) != 2 || !key || !count) continue;
+        warm_picks[n].key = key & 0xFFFFFFFFFFull;
+        warm_picks[n++].count = count < (1u << 20) ? count : (1u << 20);
+    }
+    fclose(f);
+    warm_npicks = n;
+    for (u32 i = 0; i < n; i++)
+        for (u32 g = 2; g < warm_ngroups; g++)
+            if ((warm_groups[g].kind == WG_FIGHTER || warm_groups[g].kind == WG_STAGE || warm_groups[g].kind == WG_MAYBE) &&
+                warm_groups[g].key == warm_picks[i].key) {
+                InterlockedExchange(&warm_groups[g].likely, (LONG)warm_picks[i].count);
+                groups++;
+            }
+    fprintf(stderr, "[vulkan] warm start: %u fighters and stages played on this PC before (%s): their %u groups made right after any fight's\n",
+            n, path, groups);
+}
+
+static int warm_pick_order(const void *a, const void *b) {
+    const WarmPick *x = a, *y = b;
+    return x->count != y->count ? (x->count > y->count ? -1 : 1) : 0;
+}
+
+/* (vk_match_wait, the game's thread) this match's picks counted, and the file written again */
+static void warm_picks_commit(void) {
+    if (!warm_picks_on) return;
+    AcquireSRWLockExclusive(&warm_picks_lock);
+    u32 pending = warm_npending;
+    warm_npending = 0;
+    for (u32 p = 0; p < pending; p++) {
+        u32 i = 0;
+        while (i < warm_npicks && warm_picks[i].key != warm_pending[p]) i++;
+        if (i == warm_npicks) {
+            if (warm_npicks < WARM_PICKS) warm_npicks++;
+            else i = WARM_PICKS - 1;   /* (full: the least played goes) */
+            warm_picks[i].key = warm_pending[p];
+            warm_picks[i].count = 0;
+        }
+        if (warm_picks[i].count < (1u << 20)) warm_picks[i].count++;
+    }
+    WarmPick copy[WARM_PICKS];
+    u32 n = warm_npicks;
+    if (pending) qsort(warm_picks, n, sizeof *warm_picks, warm_pick_order);
+    memcpy(copy, warm_picks, sizeof *copy * n);
+    ReleaseSRWLockExclusive(&warm_picks_lock);
+    if (!pending) return;
+    char text[WARM_PICKS * 32 + 160], path[1200];
+    int at = snprintf(text, sizeof text, "# The fighters and stages played on this PC, and how often (gpu_vk.c, warm_picks): their pipelines are made first.\n");
+    for (u32 i = 0; i < n && at > 0 && (size_t)at < sizeof text; i++)
+        at += snprintf(text + at, sizeof text - at, "%010llx %u\n", (unsigned long long)copy[i].key, copy[i].count);
+    warm_picks_path(path, sizeof path);
+    if (at > 0 && (size_t)at < sizeof text) write_file(path, text, (size_t)at);
+}
+
+/* A pair's stage or fighter wanted (seq): the pair too, once both are this match's (mine). */
+static void warm_pair_want(WarmGroup *g, u64 key, LONG seq, LONG mine) {
+    if (key == g->key) InterlockedExchange(&g->want_a, seq);
+    if (g->key2 && key == g->key2) InterlockedExchange(&g->want_b, seq);
+    if (g->want_a >= mine && (!g->key2 || g->want_b >= mine) && g->wanted < mine) {
+        InterlockedExchange(&g->wanted, seq);
+        fprintf(stderr, "[vulkan] warm start: the match's stage %010llx with %s %010llx: %ld of its %u pipelines left, made %s\n",
+                (unsigned long long)g->key, g->key2 ? "fighter" : "no fighter", (unsigned long long)g->key2, (long)(g->n - g->done), g->n,
+                g->key2 ? "after any fight's, not waited for" : "first");
+    }
+}
+
 /* A fighter (its ui_chara hash40) or the stage (its ui_stage hash40) of the match being set up: its group made before
  * the others'. first: the match's first one (the earlier match's groups are no longer its). Any thread. */
 void vk_match_want(u64 key, int first) {
-    if (!warm_ngroups || !warm_running) return;
+    if (!warm_ngroups || !warm_nrecords) return;
     LONG seq = InterlockedIncrement(&warm_want_seq);
     if (first) InterlockedExchange(&warm_match_seq, seq);
-    for (u32 g = 2; g < warm_ngroups; g++)
-        if ((warm_groups[g].kind == WG_FIGHTER || warm_groups[g].kind == WG_STAGE) && warm_groups[g].key == key) {
-            InterlockedExchange(&warm_groups[g].wanted, seq);
-            fprintf(stderr, "[vulkan] warm start: the match's %s %010llx: %ld of its %u pipelines left, made first\n",
-                    warm_groups[g].kind == WG_FIGHTER ? "fighter" : "stage", (unsigned long long)key, (long)(warm_groups[g].n - warm_groups[g].done),
-                    warm_groups[g].n);
+    LONG mine = warm_match_seq;
+    for (u32 g = 2; g < warm_ngroups; g++) {
+        WarmGroup *w = &warm_groups[g];
+        if (w->kind == WG_PAIR && (w->key == key || w->key2 == key)) warm_pair_want(w, key, seq, mine);
+        else if ((w->kind == WG_FIGHTER || w->kind == WG_STAGE || w->kind == WG_MAYBE) && w->key == key) {
+            InterlockedExchange(&w->wanted, seq);
+            fprintf(stderr, "[vulkan] warm start: the match's %s %010llx: %ld of its %u pipelines left, made %s\n",
+                    w->kind == WG_FIGHTER ? "fighter" : w->kind == WG_STAGE ? "stage" : "fighter (perhaps)", (unsigned long long)key,
+                    (long)(w->n - w->done), w->n, w->kind == WG_MAYBE ? "after any fight's, not waited for" : "first");
         }
+    }
+    warm_wake();
+}
+
+/* (gfx_warm_hint) pick 1: a human player's fighter or the stage of the match being set up, counted in warm_picks.txt as the
+ * match is waited for. pick 0: the stage the stage screen has chosen - its group, and its pairs with the fighters played
+ * before, made right after common, before the match is set up. Any thread. */
+void vk_warm_hint(u64 key, int pick) {
+    if (!key) return;
+    if (pick) {
+        AcquireSRWLockExclusive(&warm_picks_lock);
+        u32 i = 0;
+        while (i < warm_npending && warm_pending[i] != key) i++;
+        if (i == warm_npending && warm_npending < sizeof warm_pending / sizeof *warm_pending) warm_pending[warm_npending++] = key;
+        ReleaseSRWLockExclusive(&warm_picks_lock);
+        return;
+    }
+    if (!warm_ngroups || !warm_nrecords) return;
+    LONG at = WARM_HINT + InterlockedIncrement(&warm_want_seq);
+    u32 made = 0, left = 0;
+    for (u32 g = 2; g < warm_ngroups; g++) {
+        WarmGroup *w = &warm_groups[g];
+        int fighter_played = 0;
+        if (w->kind == WG_PAIR && w->key == key && w->key2)
+            for (u32 f = 2; f < warm_ngroups && !fighter_played; f++)
+                fighter_played = warm_groups[f].kind == WG_FIGHTER && warm_groups[f].key == w->key2 &&
+                                 (warm_groups[f].likely > 0 || warm_groups[f].wanted > 0);
+        if ((w->kind == WG_STAGE && w->key == key) || (w->kind == WG_PAIR && w->key == key && (!w->key2 || fighter_played))) {
+            InterlockedExchange(&w->likely, at);
+            made += w->n;
+            left += w->n - (u32)w->done;
+        }
+    }
+    if (made) fprintf(stderr, "[vulkan] warm start: the stage screen's choice %010llx: %u of its %u pipelines left, made next\n",
+                      (unsigned long long)key, left, made);
+    warm_wake();
 }
 
 /* The frame end after the match was set up (the game's thread, before the match loads): the match's groups, the boot group
@@ -3908,10 +4316,12 @@ void vk_match_wait(void) {
     ReleaseSRWLockShared(&warm_list_lock);
     /* (tools/dev/pipeline_sweep.py groups: in its runs, from an empty list, what was listed before the match) */
     fprintf(stderr, "[vulkan] warm list: %u records listed as the match was set up\n", listed);
-    if (!warm_ngroups || !warm_running) return;
+    if (!warm_ngroups) return;
+    warm_picks_commit();
+    warm_wake();
     const char *set = getenv("SSBU_SHADER_MATCH_WAIT");
     double limit_s = set && *set ? atof(set) : 30;
-    if (limit_s <= 0) return;
+    if (limit_s <= 0 || !warm_running) return;
     LONG mine = warm_match_seq;
     u64 t0 = GetTickCount64();
     long before = 0;
@@ -3920,11 +4330,13 @@ void vk_match_wait(void) {
         long left = 0;
         for (u32 g = 0; g < warm_ngroups; g++) {
             const WarmGroup *w = &warm_groups[g];
-            if (g == WG_BOOT || g == WG_COMMON || (mine && w->wanted >= mine)) left += (long)w->n - w->done;   /* (not those in no group: #428) */
+            if (g == WG_BOOT || g == WG_COMMON || (mine && w->wanted >= mine && !warm_group_probable(w)))   /* (not those in no group: #428) */
+                left += (long)w->n - w->done;
         }
         if (!waited) before = left;
         if (!left || !warm_running || (GetTickCount64() - t0) / 1000.0 >= limit_s) break;
         if (!waited++) { watchdog_pause(1); InterlockedIncrement(&warm_urgent); }
+        { extern void (*gfx_wait_hook)(void); if (gfx_wait_hook) gfx_wait_hook(); }   /* (online: the other games hear this one is still loading) */
         Sleep(10);
     }
     if (waited) { InterlockedDecrement(&warm_urgent); watchdog_pause(0); }
@@ -4006,6 +4418,7 @@ static void warm_start(void) {
     if (capped) fprintf(stderr, "[vulkan] warm start: this card's driver crashed in a warm start before (%s): at most %llu MB of pipelines\n",
                         warm_capped, (unsigned long long)(warm_budget >> 20));
     rt_crash_module_hook = warm_crash_note;
+    if (vk_warm_only()) warm_budget = 0;   /* (its pipelines are given back as they are made: warm_one) */
     warm_bytes0 = private_bytes();
     warm_t0 = rt_clock_ns();
     /* every processor but two while the first frame (or a fight's) waits; a quarter of them behind the menus */
@@ -4023,19 +4436,8 @@ static void warm_start(void) {
     if (warm_threads_bg > warm_threads_all) warm_threads_bg = warm_threads_all;
     InterlockedExchange(&warm_urgent, 1);   /* (until the first frame's shader loading: vk_warm_gate) */
     InterlockedExchange(&warm_running, (LONG)warm_threads_all);
-    FILE *mark = fopen(warm_marker, "wb");
     warm_tries = tries;
-    if (mark) { fprintf(mark, "%d", tries + 1); fclose(mark); }
-    else fprintf(stderr, "[vulkan] warm start: no marker file (%s): one that does not finish will not be noticed\n", warm_marker);
-    for (u32 i = 0; i < warm_threads_all; i++) {
-        HANDLE t = CreateThread(NULL, 64ull << 20, warm_main, (void *)(uintptr_t)i, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-        if (!t) {
-            if (!InterlockedDecrement(&warm_running)) { warm_shader_slots = 0; DeleteFileA(warm_marker); }   /* (no thread at all: nothing is loaded) */
-            continue;
-        }
-        SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
-        CloseHandle(t);
-    }
+    warm_threads_go(warm_threads_all, 1);
 }
 
 /* ---- the draw -------------------------------------------------------------------------------------- */
@@ -4098,12 +4500,19 @@ static void stage_resources(const u32 *regs, const CbBinding cb[STAGES][18], int
         params->sb[stage][k][1] = desc[1];
         params->sb[stage][k][2] = size;
         Resident *res = nresidents && va && size && (va & 3) == 0 ? resident_covering(va, size) : NULL;   /* written by compute: the GPU's copy */
+        /* A region that ends inside the last page (a mesh's skinned vertices ending mid-page: Pikachu's) holds what the
+         * descriptor records but not the rest of the page taken above: that region, up to its end, not guest memory, where
+         * the skinned vertices are not (#342: Pikachu drawn glassy, his eyes and cheeks misplaced). Bytes past its end
+         * read as 0, as anywhere outside a storage buffer. */
+        u32 in_region = size;
+        if (!res && nresidents && va && desc[2] && desc[2] < size && (va & 3) == 0 && (res = resident_covering(va, desc[2])) != NULL)
+            in_region = (u32)(res->va + res->size - va);
         u32 skip;
         if (res) resident_check(res);
-        if (res && (b->gm[k] = resident_texels(res, va, size, &skip))) {   /* (the view may start a little before va) */
+        if (res && (b->gm[k] = resident_texels(res, va, in_region, &skip))) {   /* (the view may start a little before va) */
             params->sb[stage][k][0] = (u32)(va - skip);
             params->sb[stage][k][1] = (u32)((va - skip) >> 32);
-            params->sb[stage][k][2] = size + skip;
+            params->sb[stage][k][2] = in_region + skip;
             continue;
         }
         b->gm[k] = upload(va, size);
@@ -4502,6 +4911,22 @@ static void vk_draw_(const u32 *regs, const CbBinding cb[STAGES][18], int indexe
             if (s->wide > 1.0f) reads_wide = 1;
             int own = s == zs && !depth_read_only;
             for (u32 i = 0; i < ncolor; i++) own |= rts[i] == s;
+            /* (#353, black stages on AMD) Two fixes were written for the one report. #390 found the cause in the upload
+             * memory (the stages' vertex streams in the card's CPU-visible memory: SSBU_VK_SYSMEM, on by default on
+             * AMD), with the same fault and fix known from ssbu-recomp#127. This one was a guess made before it, never
+             * run on an AMD card: that the driver draws black when a draw samples the depth attachment it is bound to,
+             * so there it read as nothing, as before #289 - which costs soft particles their fade by the scene's
+             * depth. It is the same case, so it is off by default now and AMD samples its own depth as the other
+             * GPUs do; SSBU_VK_AMD_DEPTH_SELF=0 puts the workaround back (to try if a stage is still black with
+             * SSBU_VK_SYSMEM on). */
+            static int amd_self = -1;
+            if (amd_self < 0) amd_self = limits_vendor != 0x1002 || !(getenv("SSBU_VK_AMD_DEPTH_SELF") && !strcmp(getenv("SSBU_VK_AMD_DEPTH_SELF"), "0"));
+            if (s == zs && !own && !amd_self) {
+                static int told_amd;
+                if (!told_amd++) fprintf(stderr, "[gfx] vulkan: AMD: a draw's own depth target reads as nothing (SSBU_VK_AMD_DEPTH_SELF=0)\n");
+                b->tex[k] = VK_NULL_HANDLE;
+                continue;
+            }
             if (s == zs && !own) {
                 static int told;
                 if (!told++) fprintf(stderr, "[gfx] vulkan: a draw samples its own depth target, read-only (soft particles)\n");
@@ -5753,6 +6178,13 @@ static const GfxBackend *start_backend(char *why, size_t size, int automatic) {
     InitializeCriticalSection(&lock);
     window = (HWND)gfx_window_open();
     if (!window) { snprintf(why, size, "the game's window could not be made"); return NULL; }
+#ifdef _WIN32
+    /* (as Direct3D's start does, gpu_d3d11.c WARM_GAME: Prepare Shaders (tools/shader_aot.py) pauses its compile while a
+     * game holds this. The Vulkan start never made it, so with Vulkan drawing - the default - the compile went on at
+     * full pace on every core through the player's matches. Kept for the process's life. SSBU_VK_GAME_MUTEX=0: as before.
+     * Not the warm-only pass: it is no game, and ends when one starts.) */
+    { const char *off = getenv("SSBU_VK_GAME_MUTEX"); if (!(off && *off == '0') && !vk_warm_only()) CreateMutexA(NULL, FALSE, GAME_RUNNING); }
+#endif
     vkCreateInstance_ = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
     if (!vkCreateInstance_) { snprintf(why, size, "the Vulkan loader lacks vkCreateInstance"); return NULL; }
     const char *iext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
@@ -5974,6 +6406,7 @@ int vk_present_again(void) {
 int vk_present_again(void) { return 0; }
 void vk_match_want(unsigned long long key, int first) { (void)key; (void)first; }
 void vk_match_wait(void) {}
+void vk_warm_hint(unsigned long long key, int pick) { (void)key; (void)pick; }
 
 const struct GfxBackend *vk_backend_start(char *why, size_t size, int automatic) {
     (void)automatic;
