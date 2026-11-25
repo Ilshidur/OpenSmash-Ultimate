@@ -393,6 +393,8 @@ typedef struct Handle {
     int system_save;          /* the game's system save (system_data.bin): its text language is the chosen one */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
+    size_t list_cap;
+    int list_failed;
 } Handle;
 static Handle handles[512];
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
@@ -713,9 +715,10 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
  *     deletions are remembered (tombstones). Every open, listing and query sees the working
  *     folder over the committed one, without the deleted paths.
  *   - Commit flushes the changed files, writes the list of changes to the journal
- *     save/<user>.journal.<process id>, flushes it and renames it to save/<user>.commit: the
- *     commit is decided there. Then the changes are applied (deletions, new folders, each file
- *     moved over the committed one) and that marker deleted. Every step can be done again, so
+ *     save/<user>.journal.<process id>, flushes it and renames it to save/<user>.commit (never
+ *     over another): the commit is decided there. Once that name is flushed to the disk, the
+ *     changes are applied (deletions, new folders, each file moved over the committed one) and
+ *     that marker deleted; a flush that fails leaves the commit pending, applied later. Every step can be done again, so
  *     a process stopped after the rename has its commit finished by the next mount, by any
  *     process; one stopped before leaves the committed save as it was.
  *   - Unmount discards uncommitted changes, as the console does; so does the next mount, for
@@ -729,7 +732,10 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
  * Windows a committed file still open for reading is replaced as POSIX does it, and a read-only
  * mark is cleared first.
  * One process at a time commits or recovers: a lock file beside the save (save/<user>.lock),
- * on Windows a named mutex. One process mounts a save once. */
+ * on Windows a named mutex. When the lock cannot be taken the journal goes on without it, as it
+ * always did, and says so in the log; with SSBU_FS_LOCK_STRICT=1 nothing is done without it: the
+ * mount fails, Commit fails and a decided commit waits (another process may be applying it). One
+ * process mounts a save once. */
 #define SHARE_ALL (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)   /* (a commit can move a file someone reads) */
 #define JOURNAL_FORMAT "ssbu-save-journal 1"   /* the journal's first line */
 #ifndef ERROR_SHARING_VIOLATION
@@ -740,13 +746,18 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
 #endif
 
 #ifdef _WIN32
-typedef HANDLE SaveLock;
+typedef HANDLE SaveLock;   /* (NULL: not taken) */
 static SaveLock lock_saves(const char *root) {
     (void)root;
     HANDLE mx = CreateMutexA(NULL, FALSE, "Local\\ssbu-save-journal");
-    if (mx) WaitForSingleObject(mx, INFINITE);   /* (WAIT_ABANDONED: its holder died; it is ours now) */
-    return mx;
+    DWORD w = mx ? WaitForSingleObject(mx, INFINITE) : WAIT_FAILED;
+    if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) return mx;   /* (WAIT_ABANDONED: its holder died; it is ours now) */
+    DWORD err = GetLastError();
+    if (mx) CloseHandle(mx);
+    SetLastError(err);
+    return NULL;
 }
+static int saves_locked(SaveLock mx) { return mx != NULL; }
 static void unlock_saves(SaveLock mx) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } }
 static int pid_alive(DWORD pid) {
     HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
@@ -760,29 +771,63 @@ static int pid_alive(DWORD pid) {
  * goes to the disk within seconds, not when MoveFileEx returns (MOVEFILE_WRITE_THROUGH is
  * documented for moves done as a copy): a power cut just after a commit can bring back the save
  * before it, whole. */
-static void flush_dir(const char *path) { (void)path; }
+static int flush_dir(const char *path) { (void)path; return 1; }
 #else
-typedef int SaveLock;
+typedef int SaveLock;   /* (-1: not taken) */
 static SaveLock lock_saves(const char *root) {   /* (flock: the shim's objects have no names) */
     char path[1024], unix_path[1024];
     snprintf(path, sizeof path, "%s.lock", root);
-    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd >= 0) while (flock(fd, LOCK_EX) && errno == EINTR) {}
+    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDWR | O_CREAT | O_CLOEXEC, 0644), r = -1;
+    if (fd < 0 && (errno == EACCES || errno == EROFS))   /* (flock needs no write access: a lock file left read-only, or another user's) */
+        fd = open(unix_path, O_RDONLY | O_CLOEXEC);
+    while (fd >= 0 && (r = flock(fd, LOCK_EX)) && errno == EINTR) {}
+    if (fd >= 0 && r) { int err = errno; close(fd); errno = err; fd = -1; }
+    if (fd < 0) SetLastError(rt_win32_error(errno));
     return fd;
 }
+static int saves_locked(SaveLock fd) { return fd >= 0; }
 static void unlock_saves(SaveLock fd) { if (fd >= 0) close(fd); }
 static int pid_alive(DWORD pid) { return pid && pid <= 0x7FFFFFFF && (kill((pid_t)pid, 0) == 0 || errno == EPERM); }
-static void flush_dir(const char *path) {   /* the names in a folder: POSIX makes them durable only so */
+/* The names in a folder: POSIX makes them durable only so. 0 if that failed (an I/O error). Some
+ * file systems cannot flush a folder at all (EINVAL, ENOTSUP, ENOSYS: some network and FUSE
+ * ones): there the save goes on as it did before folders were flushed, with no promise about a
+ * power cut, said once in the log - failing would leave the save unmountable for good. */
+static int flush_dir(const char *path) {
+    static int unflushable_said;
     char unix_path[1024];
-    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
+    int fd = open(rt_unix_path(path, unix_path, sizeof unix_path), O_RDONLY | O_CLOEXEC), r = -1;
+    if (fd < 0) { SetLastError(rt_win32_error(errno)); return 0; }
 #ifdef __APPLE__
-    if (fcntl(fd, F_FULLFSYNC))   /* (fsync leaves it in the drive's cache) */
+    if ((r = fcntl(fd, F_FULLFSYNC)))   /* (fsync leaves it in the drive's cache) */
 #endif
-        fsync(fd);
+        r = fsync(fd);
+    int err = errno;
     close(fd);
+    if (r && (err == EINVAL || err == ENOTSUP || err == ENOSYS)) {
+        if (!__atomic_exchange_n(&unflushable_said, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[fs] %s: this file system cannot flush a folder (errno %d); saves go on without it\n", path, err);
+        return 1;
+    }
+    if (r) { fprintf(stderr, "[fs] %s: flushing the folder failed (errno %d)\n", path, err); SetLastError(rt_win32_error(err)); }
+    return !r;
 }
 #endif
+
+/* Whether to go on when the save lock was not taken (`refused` says what is not done otherwise).
+ * By default yes, as before the lock could fail: one process loses nothing, only two at once
+ * could apply or drop each other's commit. SSBU_FS_LOCK_STRICT=1 refuses instead. It is not the
+ * default because a file system without locks (NFS without its lock daemon: ENOLCK) or a
+ * non-file where the lock file goes would then leave the save unmountable. (Read at each call:
+ * fstest switches it.) */
+static int saves_go_on(SaveLock l, const char *root, const char *refused) {
+    if (saves_locked(l)) return 1;
+    DWORD err = GetLastError();
+    const char *e = getenv("SSBU_FS_LOCK_STRICT");
+    int strict = e && !strcmp(e, "1");
+    fprintf(stderr, "[fs] %s: the save lock could not be taken (error %lu): %s\n", root, (unsigned long)err,
+            strict ? refused : "going on without it (SSBU_FS_LOCK_STRICT=1 refuses)");
+    return !strict;
+}
 
 #ifdef FS_TEST
 /* tools/dev/fstest.c: SSBU_FS_CRASH_AT=n ends the process at the n-th of these, as a crash would */
@@ -800,6 +845,11 @@ static void crash_point(void) {
 #endif
 
 static DWORD attributes(const char *p) { return GetFileAttributesA(p); }
+static int absent(const char *p) {   /* nothing there - not a path that could not be looked at (no access, a disk error) */
+    if (attributes(p) != INVALID_FILE_ATTRIBUTES) return 0;
+    DWORD e = GetLastError();
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+}
 static int is_dir(const char *p) { DWORD a = attributes(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 static int is_file(const char *p) { DWORD a = attributes(p); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
 static void join(char *out, size_t n, const char *dir, const char *rel) {   /* (dir "": rel alone) */
@@ -855,6 +905,15 @@ static int move_file(const char *from, const char *to) {
     not_read_only(to);
     for (DWORD wait = 1;; wait *= 2) {
         if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) || replace_open_file(from, to)) return 1;
+        if (!held() || wait > 512) return 0;
+        Sleep(wait);
+    }
+}
+/* A move that never replaces (0 if something is at `to`), on the disk when it returns: the
+ * journal becoming the marker. */
+static int move_new(const char *from, const char *to) {
+    for (DWORD wait = 1;; wait *= 2) {
+        if (MoveFileExA(from, to, MOVEFILE_WRITE_THROUGH)) return 1;
         if (!held() || wait > 512) return 0;
         Sleep(wait);
     }
@@ -1031,8 +1090,8 @@ static void journal_deletes(Text *t, struct Mount *m, const char *rel) {
     FindClose(h);
 }
 
-/* Every folder (M) and file (F) of the working folder, parents first; each file flushed.
- * 0 if one could not be. */
+/* Every folder (M) and file (F) of the working folder, parents first; each file and folder
+ * flushed. 0 if one could not be: the commit then fails before it is decided. */
 static int journal_work(Text *t, const char *work, const char *rel) {
     char dir[1024], pat[1024], sub[512], full[1024];
     WIN32_FIND_DATAA fd;
@@ -1056,7 +1115,7 @@ static int journal_work(Text *t, const char *work, const char *rel) {
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    flush_dir(dir);
+    ok &= flush_dir(dir);
     return ok;
 }
 
@@ -1073,8 +1132,8 @@ static int journal_apply(const char *root) {
     char marker[1024], parent[1024], work[1024] = "", a[1024], b[1024];
     snprintf(marker, sizeof marker, "%s.commit", root);
     parent_of(parent, sizeof parent, root);
-    if (attributes(marker) == INVALID_FILE_ATTRIBUTES) return 1;
-    char *text = read_text(marker);
+    if (absent(marker)) return 1;
+    char *text = read_text(marker);   /* (NULL too when the marker could not be looked at: tried again later) */
     if (!text) return -1;
     size_t len = strlen(text), head = strlen(JOURNAL_FORMAT "\n");
     if (len < head + 2 || memcmp(text, JOURNAL_FORMAT "\n", head) || strcmp(text + len - 2, "E\n") || (len > head + 2 && text[len - 3] != '\n')) {
@@ -1083,6 +1142,11 @@ static int journal_apply(const char *root) {
         if (!delete_file(marker)) return -1;
         flush_dir(parent);
         return 0;
+    }
+    if (!flush_dir(parent)) {   /* (nothing moved over the committed save before the marker's name is on the disk) */
+        free(text);
+        fprintf(stderr, "[fs] %s: the save's folder could not be flushed (error %lu); applied later\n", marker, (unsigned long)GetLastError());
+        return -1;
     }
     int ok = 1;
     for (char *line = text + head, *next; ok && *line; line = next) {
@@ -1100,21 +1164,20 @@ static int journal_apply(const char *root) {
         join(a, sizeof a, root, arg);
         if (!strcmp(line, "Dd")) {   /* a folder that goes */
             if (is_dir(a)) remove_tree(a);
-            ok = !is_dir(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = !is_dir(a) && (!is_dir(b) || flush_dir(b));   /* (an I/O error fails the step: the marker must not go before it is on the disk) */
         } else if (!strcmp(line, "Df")) {   /* a file that goes */
             ok = !is_file(a) || delete_file(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = ok && (!is_dir(b) || flush_dir(b));
         } else if (!strcmp(line, "M")) {   /* a folder the save has now */
             if (!is_dir(a)) { make_parents(a); CreateDirectoryA(a, NULL); }
-            ok = is_dir(a);
             parent_of(b, sizeof b, a);
-            flush_dir(b);
+            ok = is_dir(a) && flush_dir(b);
         } else if (!strcmp(line, "F")) {   /* a file: the working copy moves over the committed one */
             join(b, sizeof b, work, arg);
-            if (attributes(b) != INVALID_FILE_ATTRIBUTES) { make_parents(a); ok = move_file(b, a); }
+            if (!absent(b)) { make_parents(a); ok = move_file(b, a); }   /* (absent: moved already; one that cannot be looked at fails the move) */
+            else { parent_of(b, sizeof b, a); ok = !is_dir(b) || flush_dir(b); }   /* (moved by a try whose flush failed: flushed now, before the marker goes) */
         } else ok = 0;
         crash_point();
     }
@@ -1125,7 +1188,8 @@ static int journal_apply(const char *root) {
     }
     crash_point();
     if (!delete_file(marker)) return -1;
-    flush_dir(parent);   /* (before anything else goes into the working folder: the marker must not be applied twice) */
+    flush_dir(parent);   /* (before anything else goes into the working folder: the marker must not be applied twice.
+                          * An I/O error here is logged, not a failure: the commit is applied, and its marker gone) */
     crash_point();
     return 1;
 }
@@ -1143,7 +1207,7 @@ static void journal_done(struct Mount *m) {
 static int journal_settle(struct Mount *m) {
     if (!m->pending) return 1;
     SaveLock l = lock_saves(m->root);
-    if (journal_apply(m->root) >= 0) journal_done(m);
+    if (saves_go_on(l, m->root, "a decided commit waits") && journal_apply(m->root) >= 0) journal_done(m);
     unlock_saves(l);
     return !m->pending;
 }
@@ -1188,10 +1252,21 @@ static int writer_open(u32 mount) {   /* a file of the mount is open for writing
     return found;
 }
 
+/* Whether the marker is this process's journal: it starts as journal_commit writes one, with this
+ * process's id on its W line. (Not readable: not known to be, so not.) */
+static int marker_is_mine(const char *marker, const char *pid) {
+    char want[64], *text = read_text(marker);
+    snprintf(want, sizeof want, "%s\nW\t%s\n", JOURNAL_FORMAT, pid);
+    int mine = text && !strncmp(text, want, strlen(want));
+    free(text);
+    return mine;
+}
+
 static u32 journal_commit(struct Mount *m) {
     char journal[1024], marker[1024], pid[16];
     if (writer_open(m->id)) return R_WRITE_FILE_OPEN;   /* ([sdk] FileSystemAccessor::Commit refuses too) */
     SaveLock l = lock_saves(m->root);
+    if (!saves_go_on(l, m->root, "the commit is refused")) return R_HOST_FAILURE;
     if (journal_apply(m->root) < 0) { unlock_saves(l); return R_HOST_FAILURE; }   /* (a decided commit first, whichever process made it) */
     if (m->pending) journal_done(m);
     if (!m->ntomb && folder_empty(m->work)) { unlock_saves(l); return 0; }   /* (nothing changed) */
@@ -1221,7 +1296,17 @@ static u32 journal_commit(struct Mount *m) {
     } else ok = 0;
     free(t.p);
     crash_point();
-    if (ok && !move_file(journal, marker)) ok = attributes(journal) == INVALID_FILE_ATTRIBUTES && attributes(marker) != INVALID_FILE_ATTRIBUTES;
+    /* the decision: the journal takes the marker's name, never over another marker (journal_apply
+     * above left none). A move that went through but whose flush failed is decided but not known
+     * to be on the disk: left pending, not applied now */
+    int synced = ok && move_new(journal, marker);
+    DWORD move_error = GetLastError();
+    if (ok && !synced) {   /* (journal_apply above left no marker, but without the lock another process may have put its
+                            * own there in between: a marker counts as this decision only if its W line is this process) */
+        ok = marker_is_mine(marker, pid);
+        if (ok && !absent(journal)) DeleteFileA(journal);   /* (a link-then-unlink move cut short: one file under both names) */
+    }
+    SetLastError(move_error);
     if (!ok) {   /* not decided: the committed save is as it was */
         fprintf(stderr, "[fs] commit of %s failed before it was decided (error %lu)\n", m->root, (unsigned long)GetLastError());
         DeleteFileA(journal);
@@ -1230,7 +1315,8 @@ static u32 journal_commit(struct Mount *m) {
     }
     crash_point();   /* (decided) */
     m->pending = 1;
-    if (journal_apply(m->root) >= 0) journal_done(m);
+    if (!synced) fprintf(stderr, "[fs] commit of %s decided, but its flush failed (error %lu); applied later\n", m->root, (unsigned long)GetLastError());
+    else if (journal_apply(m->root) >= 0) journal_done(m);
     unlock_saves(l);
     if (!m->pending) fprintf(stderr, "[fs] save committed (%d changes)\n", changes);
     return m->pending ? R_HOST_FAILURE : 0;   /* (pending: every call on the mount tries it again first; the next mount finishes it) */
@@ -1251,7 +1337,7 @@ static u32 journal_mount(const char *name, const char *where) {
     if (!r) {
         make_dirs(root);
         SaveLock l = lock_saves(root);
-        r = journal_recover(root);
+        r = saves_go_on(l, root, "the save is not mounted") ? journal_recover(root) : R_HOST_FAILURE;   /* (strict: nothing recovered or dropped without it) */
         if (!r) {   /* (left by a process that had this number before) */
             snprintf(work, sizeof work, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
             snprintf(journal, sizeof journal, "%s.journal.%lu", root, (unsigned long)GetCurrentProcessId());
@@ -1329,7 +1415,7 @@ static int listing_host(Handle *h, const char *dir, int mode, struct Mount *m, c
         while (k < h->count && _stricmp(h->names[k], fd.cFileName)) k++;
         if (k < h->count) { h->types[k] = isdir ? DIR_ENTRY : FILE_ENTRY; h->sizes[k] = size; }
         else listing_add(h, fd.cFileName, strlen(fd.cFileName), isdir ? DIR_ENTRY : FILE_ENTRY, size);
-    } while (FindNextFileA(fh, &fd));
+    } while (!h->list_failed && FindNextFileA(fh, &fd));
     FindClose(fh);
     return 1;
 }
@@ -1342,7 +1428,7 @@ static u32 save_list(struct Mount *m, const char *rest, int mode, Handle *h) {  
     if (!tomb_hides(m, rel)) { join(path, sizeof path, m->root, rel); listing_host(h, path, mode, m, rel, 0); }
     join(path, sizeof path, m->work, rel);
     listing_host(h, path, mode, NULL, NULL, 1);
-    return 0;
+    return h->list_failed ? R_HOST_FAILURE : 0;
 }
 
 static u32 save_delete(struct Mount *m, const char *rest, int dir) {
@@ -1352,9 +1438,10 @@ static u32 save_delete(struct Mount *m, const char *rest, int dir) {
     if (!rel[0] || view(m, rel, path, sizeof path) != (dir ? 2 : 1)) return R_PATH_NOT_FOUND;
     if (dir) {   /* only an empty folder, as the host's own RemoveDirectory */
         Handle h = {0};
-        save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
+        r = save_list(m, rest, LIST_DIRS | LIST_FILES, &h);
         i64 n = h.count;
         listing_free(&h);
+        if (r) return r;
         if (n) return R_PATH_NOT_FOUND;
     }
     join(path, sizeof path, m->work, rel);
@@ -1694,18 +1781,37 @@ HLE(_ZN2nn2fs15DeleteDirectoryEPKc) {
 
 /* ---- directories ----------------------------------------------------------------- */
 static void listing_add(Handle *h, const char *name, size_t len, int type, u64 size) {
-    h->names = realloc(h->names, sizeof *h->names * (h->count + 1));
-    h->types = realloc(h->types, h->count + 1);
-    h->sizes = realloc(h->sizes, sizeof *h->sizes * (h->count + 1));
-    h->names[h->count] = malloc(len + 1);
-    memcpy(h->names[h->count], name, len);
-    h->names[h->count][len] = 0;
+    if (h->list_failed) return;
+    if ((size_t)h->count == h->list_cap) {
+        /* Large mod directories used to resize all three arrays for every entry. Grow
+         * geometrically; keep every successful allocation owned if a later one fails. */
+        if (h->list_cap > SIZE_MAX / 2 / sizeof *h->names) { h->list_failed = 1; return; }
+        size_t cap = h->list_cap ? h->list_cap * 2 : 32;
+        char **names = realloc(h->names, cap * sizeof *names);
+        if (!names) { h->list_failed = 1; return; }
+        h->names = names;
+        u8 *types = realloc(h->types, cap * sizeof *types);
+        if (!types) { h->list_failed = 1; return; }
+        h->types = types;
+        u64 *sizes = realloc(h->sizes, cap * sizeof *sizes);
+        if (!sizes) { h->list_failed = 1; return; }
+        h->sizes = sizes;
+        h->list_cap = cap;
+    }
+    if (len == SIZE_MAX) { h->list_failed = 1; return; }
+    char *copy = malloc(len + 1);
+    if (!copy) { h->list_failed = 1; return; }
+    memcpy(copy, name, len);
+    copy[len] = 0;
+    h->names[h->count] = copy;
     h->types[h->count] = (u8)type;
     h->sizes[h->count++] = size;
 }
 static void listing_free(Handle *h) {
     for (i64 i = 0; i < h->count; i++) free(h->names[i]);
     free(h->names); free(h->types); free(h->sizes);
+    h->names = NULL; h->types = NULL; h->sizes = NULL;
+    h->count = h->next = 0; h->list_cap = 0; h->list_failed = 0;
 }
 
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
@@ -1722,16 +1828,16 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         u32 d, f;
         if (!rom_lookup(rest, &d, &f) || f != NONE) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & LIST_DIRS)
-            for (u32 k = rom_dir(d)->child_dir; k != NONE; k = rom_dir(k)->sibling)
+            for (u32 k = rom_dir(d)->child_dir; k != NONE && !h.list_failed; k = rom_dir(k)->sibling)
                 listing_add(&h, rom_dir(k)->name, rom_dir(k)->name_len, DIR_ENTRY, 0);
         if (mode & LIST_FILES)
-            for (u32 k = rom_dir(d)->child_file; k != NONE; k = rom_file(k)->sibling)
+            for (u32 k = rom_dir(d)->child_file; k != NONE && !h.list_failed; k = rom_file(k)->sibling)
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
         load_mods_list();   /* (the turned-on mods only) */
         char flat[4200];
-        for (int i = 0; i < mods_count && (mode & LIST_DIRS); i++) {
+        for (int i = 0; i < mods_count && (mode & LIST_DIRS) && !h.list_failed; i++) {
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
@@ -1739,7 +1845,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         /* every turned-on mod's files as one tree: a later mod's entry over an earlier one's */
         load_mods_list();
         int found = 0;
-        for (int i = 0; i < mods_count; i++) {
+        for (int i = 0; i < mods_count && !h.list_failed; i++) {
             char path[4400];
             snprintf(path, sizeof path, "%s/../../mods/%s/%s", rt_data_dir, mods_list[i], rest + strspn(rest, "/"));
             for (char *q = path; *q; q++) if (*q == '/') *q = '\\';
@@ -1757,7 +1863,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
                 while (k < h.count && _stricmp(h.names[k], fd.cFileName)) k++;
                 if (k < h.count) { h.types[k] = dir ? DIR_ENTRY : FILE_ENTRY; h.sizes[k] = size; }
                 else listing_add(&h, fd.cFileName, strlen(fd.cFileName), dir ? DIR_ENTRY : FILE_ENTRY, size);
-            } while (FindNextFileA(fh, &fd));
+            } while (!h.list_failed && FindNextFileA(fh, &fd));
             FindClose(fh);
         }
         if (!found) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
@@ -1769,7 +1875,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
-        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (!listing_host(&h, path, mode, NULL, NULL, 0)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
         if (!strcmp(m->name, "sd")) {   /* a mod's own copy of a file .characters provides is not shown to ARCropolis */
             for (i64 k = 0; k < h.count; ) {
                 if (h.types[k] == FILE_ENTRY && hidden_from_arcropolis(rest, h.names[k])) {
@@ -1782,6 +1888,7 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
             }
         }
     }
+    if (h.list_failed) { listing_free(&h); c->x[0] = R_HOST_FAILURE; return; }
     u64 v = new_handle(h);
     if (!v) { listing_free(&h); c->x[0] = R_TOO_MANY_HANDLES; return; }
     st64(c->x[0], v);

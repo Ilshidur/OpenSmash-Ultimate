@@ -11,7 +11,7 @@
  *                      then, from a relay that knows the room's game: 'W' 'D', the room host's
  *                      build[40], sim u32, flags u8 (1: sim and mods known), mod set (flag 1) -
  *                      what differs, said by the refused game (refusal_detail); reasons 1 full,
- *                      2 another netplay version, 3 another game build, 6 another WindowSmash
+ *                      2 another netplay version, 3 another game build, 6 another OpenSmash
  *                      (simulation version) or other mods. Older games read the text only.
  *   4 PING     client: nonce u64, time u64, cookie u64, ping u16   (every second; keeps NAT open)
  *   5 PONG     relay:  time u64, players u16, rooms u16, flags u8
@@ -30,7 +30,7 @@
  *  14 PUNCH    player: secret u64, from u32, to u32, ack u8, nonce u64   (straight to another player)
  *  15 DIRECT   player: secret u64, then as DATA                         (the same)
  * A JOIN of version 2 from this game ends with 'W' 'S', its simulation version u32 and its mod set
- * (as version 3's, below): a private room's relay then refuses a game whose WindowSmash or mods
+ * (as version 3's, below): a private room's relay then refuses a game whose OpenSmash or mods
  * differ from the host's, saying which (REJECT's detail); relays and lobbies that don't know it
  * read the JOIN as before.
  * A game that can connect directly adds to its PINGs: peers version u32 (of the last PEERS it got),
@@ -121,7 +121,7 @@ enum { W_LOBBY = 1, W_INTRODUCES = 2, W_ROOMS = 4, W_MATCH = 8, W_RB = 16 };   /
 #define MODS_MAX 32                                  /* (a mod set's entries, at most; MOD_NAME: mod_diff.h) */
 #define MOD_SET_MAX (1 + MODS_MAX * (5 + MOD_NAME))
 #define REJECT_SIZE (4 + 8 + 1 + 64)
-#define R_OTHER 6     /* REJECT's reason: another WindowSmash (simulation version) or other mods */
+#define R_OTHER 6     /* REJECT's reason: another OpenSmash (simulation version) or other mods */
 #define ROOM_MEMBERS 8
 #define TIMEOUT_MS 10000
 #define UNREACHABLE_MS 5000   /* unanswered this long: the game plays offline (and keeps asking) */
@@ -160,7 +160,7 @@ static void send_udp(SOCKET s, const void *p, int n, const struct sockaddr_in *t
     if ((err == EHOSTUNREACH || err == EPERM) && local_network(ntohl(to->sin_addr.s_addr)) && !InterlockedExchange(&told, 1)) {
         char ip[16];
         inet_ntop(AF_INET, &to->sin_addr, ip, sizeof ip);
-        fprintf(stderr, "[net] macOS keeps the game off your local network (%s:%u: %s): allow WindowSmash in System Settings > "
+        fprintf(stderr, "[net] macOS keeps the game off your local network (%s:%u: %s): allow OpenSmash in System Settings > "
                         "Privacy & Security > Local Network\n", ip, ntohs(to->sin_port), strerror(err));
     }
 #endif
@@ -267,6 +267,20 @@ static void ticket_refresh(void) {
         memset(name, 0, sizeof name);
         memcpy(name, a + 1, (size_t)(b - a - 1));
     }
+}
+/* (#510) the official lobby and no ticket: net_status says so, and what to do. A launcher that signs in names itself
+ * (OPENSMASH_LAUNCHER_VERSION, OpenSmash.Core.VersionInfo.EnvName) or the ticket's file; neither, on Windows, is an
+ * OpenSmash.exe from before the account sign-in (v0.4.x: a copy that follows main keeps it without the .NET SDK) or
+ * no launcher at all, and "sign in in the launcher" cannot be done there. */
+static volatile LONG no_ticket;
+static const char *no_ticket_hint(void) {
+    const char *lv = getenv("OPENSMASH_LAUNCHER_VERSION"), *f = getenv("SSBU_ONLINE_TICKET_FILE");
+    if ((lv && *lv) || (f && *f)) return "SIGN IN in the OpenSmash launcher, then join again";
+#ifdef _WIN32
+    return "this launcher is too old to sign in: get the new OpenSmash.exe (tools\\build_launcher.ps1 with the .NET 8 SDK, or an update), then SIGN IN";
+#else
+    return "start the game from the OpenSmash launcher and SIGN IN there";
+#endif
 }
 
 static void configure_from_files(void) {
@@ -419,7 +433,8 @@ static BOOL CALLBACK configure_once(PINIT_ONCE once, void *param, void **ctx) {
         if (direct_ok) fprintf(stderr, "[net] direct paths stay off with the official lobby\n");
         direct_ok = 0;
         ticket_refresh();
-        if (!ticket[0]) fprintf(stderr, "[net] no lobby ticket: sign in in the launcher to play online\n");
+        InterlockedExchange(&no_ticket, !ticket[0]);
+        if (!ticket[0]) fprintf(stderr, "[net] no lobby ticket, the official lobby takes signed-in players only: %s\n", no_ticket_hint());
     }
     return TRUE;
 }
@@ -558,7 +573,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             int other_sim = r && r->count && r->tail && jlen && jsim != r->sim;
             int other_mods = r && r->count && r->tail && jlen && !other_sim && !mod_sets_same(r->mods, jmods);
             const char *why = !r ? "the relay is full" : r->count == ROOM_MEMBERS ? "the room is full (8 players)"
-                            : other_build ? "the host has another game version" : other_sim ? "the host has another WindowSmash version"
+                            : other_build ? "the host has another game version" : other_sim ? "the host has another OpenSmash version"
                             : other_mods ? "the host runs other mods" : NULL;
             if (why) {
                 u8 rej[REJECT_SIZE + 2 + BUILD_LEN + 5 + MOD_SET_MAX];
@@ -2019,6 +2034,7 @@ static void send_join(void) {
     mod_set_make();
     int official = official_relay();
     if (official) ticket_refresh();   /* (a renewed ticket, and its name) */
+    InterlockedExchange(&no_ticket, official && !ticket[0]);   /* (a sign-in after the start: the file's ticket, said at once) */
     header(p, T_JOIN);
     put64(p + 4, nonce);
     memcpy(p + 12, room, strlen(room));
@@ -2140,7 +2156,7 @@ static void room_why(const char *b, u32 sim, const Mod *m, int nm, char *out, si
     *kind = _stricmp(b, mine) ? NET_WHY_BUILD : sim != SIM_VERSION ? NET_WHY_SIM : NET_WHY_MODS;
     if (_stricmp(b, mine)) { snprintf(out, n, "Another version of the game: this room's is build %.8s, yours %.8s", b, mine); return; }
     if (sim != SIM_VERSION) {
-        snprintf(out, n, "Another version of WindowSmash: this room's simulation version is %u, yours %u (the older one needs updating)",
+        snprintf(out, n, "Another version of OpenSmash: this room's simulation version is %u, yours %u (the older one needs updating)",
                  (unsigned)sim, (unsigned)SIM_VERSION);
         return;
     }
@@ -2151,7 +2167,7 @@ static void room_why(const char *b, u32 sim, const Mod *m, int nm, char *out, si
     if (!out[0]) snprintf(out, n, "Other mods, of the same names");
 }
 
-/* A room's game and mods, for the room browser's details: its build, WindowSmash (simulation
+/* A room's game and mods, for the room browser's details: its build, OpenSmash (simulation
  * version) and netplay version, each said against this game's, and its mods, each marked as this
  * game has it. */
 static void room_details(const NetRoom *r, const Mod *m, int nm, char *out, size_t n) {
@@ -2166,7 +2182,7 @@ static void room_details(const NetRoom *r, const Mod *m, int nm, char *out, size
     else snprintf(build, sizeof build, "%.8s (yours %.8s)", r->build, mine);
     if (r->sim == SIM_VERSION) snprintf(sim, sizeof sim, "%u (yours too)", (unsigned)r->sim);
     else snprintf(sim, sizeof sim, "%u (yours %u)", (unsigned)r->sim, (unsigned)SIM_VERSION);
-    snprintf(out, n, "Game build %s, WindowSmash simulation version %s, netplay version 3\nMods: %s", build, sim, nm ? mods : "none");
+    snprintf(out, n, "Game build %s, OpenSmash simulation version %s, netplay version 3\nMods: %s", build, sim, nm ? mods : "none");
 }
 
 /* What differs between this game and the room's host's, from a REJECT's detail (build[40], sim u32,
@@ -2182,7 +2198,7 @@ static void refusal_detail(const u8 *d, int n, char *out, size_t size) {
     if (_stricmp(build, mine)) { snprintf(out, size, "Game build differs: the room's (or lobby's) is %.8s, yours %.8s", build, mine); return; }
     if (!known) return;
     if (sim != SIM_VERSION) {
-        snprintf(out, size, "WindowSmash differs: simulation version %u in the room, %u in yours (the older one needs updating)", (unsigned)sim,
+        snprintf(out, size, "OpenSmash differs: simulation version %u in the room, %u in yours (the older one needs updating)", (unsigned)sim,
                  (unsigned)SIM_VERSION);
         return;
     }
@@ -2937,6 +2953,7 @@ void net_status(char *out, size_t n) {
     start();
     if (net_backend) { net_backend->status(out,n); return; }
     if (!configured) { if (n) out[0] = 0; return; }
+    if (no_ticket && !joined) { snprintf(out, n, "Netplay: not signed in, the official lobby takes signed-in players only\n%s", no_ticket_hint()); return; }
     if (reject_text[0] && !joined) { snprintf(out, n, "Netplay: %s%s%s", reject_text, reject_detail[0] ? "\n" : "", reject_detail); return; }
     if (lan_mode && !joined && lan_state != NET_LAN_FOUND) { snprintf(out, n, "Netplay: looking for a room on this network..."); return; }
     if (!joined && net_unreachable()) { snprintf(out, n, "Netplay: no answer from %s - playing offline (still trying)", relay_text); return; }

@@ -44,7 +44,8 @@ $PublicLobby = 'eu.lobby.opensmashultimate.com:39421'   # (the official lobby's 
 # own settings menu (Esc > Online > Server region) or in OpenSmash.exe. Players on another region are not listed.
 $ServerRegions = @(
     @{ Id = 'eu'; Label = 'EU'; Lobby = 'eu.lobby.opensmashultimate.com:39421' },
-    @{ Id = 'na-east'; Label = 'NA East'; Lobby = 'na.lobby.opensmashultimate.com:39421' })
+    @{ Id = 'na-east'; Label = 'NA East'; Lobby = 'na.lobby.opensmashultimate.com:39421' },
+    @{ Id = 'sa'; Label = 'South America'; Lobby = 'sa.lobby.opensmashultimate.com:39421' })
 # The game's own values when a file or key is missing (runtime/gpu_display.c, hle_pad.c).
 $Defaults = @{
     window = 'windowed'; width = '1280'; height = '720'; pacing = 'clock'; latency = '3'
@@ -336,7 +337,7 @@ $netMode = if (-not $lobbyHost -or $lobbyHost -eq 'off') { 'offline' }
 try {
 [Windows.Forms.Application]::EnableVisualStyles()
 $form = New-Object Windows.Forms.Form
-$form.Text = 'WindowSmash'
+$form.Text = 'OpenSmash'
 $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
 $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
 $form.ClientSize = New-Object Drawing.Size(760, 574)
@@ -344,7 +345,7 @@ $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
 $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
 $form.Font = New-Object Drawing.Font('Segoe UI', 9.75)
-$ico = Join-Path $Root 'docs\assets\windowsmash.ico'
+$ico = Join-Path $Root 'docs\assets\opensmash.ico'
 if (Test-Path -LiteralPath $ico) { $form.Icon = New-Object Drawing.Icon($ico) }
 $tips = New-Object Windows.Forms.ToolTip
 $tips.AutoPopDelay = 20000
@@ -513,7 +514,7 @@ $padsButton.Text = 'Open controllers.ini'
 [void](New-Text "Each controller is set up in the game: press Esc, or the controller's Home / PS / Xbox button, and go to Controllers." 196 396 548 40 -Dim)
 $padsButton.Add_Click({
     if (Test-Path -LiteralPath $padsIni) { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$padsIni`"" }
-    else { [void][Windows.Forms.MessageBox]::Show($form, "controllers.ini is written at the game's first start.", 'WindowSmash', 'OK', 'Information') }
+    else { [void][Windows.Forms.MessageBox]::Show($form, "controllers.ini is written at the game's first start.", 'OpenSmash', 'OK', 'Information') }
 })
 
 $sep = New-Object Windows.Forms.Label
@@ -598,16 +599,16 @@ $before = Get-WindowValues
 $script:played = $null
 $play.Add_Click({
     if ($modeBox.SelectedItem.Value -eq 'private' -and -not ($codeBox.Text -replace '\s', '')) {
-        [void][Windows.Forms.MessageBox]::Show($form, 'Type a lobby code: a word your friends type too.', 'WindowSmash', 'OK', 'Warning')
+        [void][Windows.Forms.MessageBox]::Show($form, 'Type a lobby code: a word your friends type too.', 'OpenSmash', 'OK', 'Warning')
         [void]$codeBox.Focus()
         return
     }
     if ($modeBox.SelectedItem.Value -eq 'custom' -and $serverBox.Text.Trim() -and $serverBox.Text.Trim() -notmatch '^\S+:\d+$') {
-        [void][Windows.Forms.MessageBox]::Show($form, 'Your own server is host:port, e.g. 192.168.1.20:39420.', 'WindowSmash', 'OK', 'Warning')
+        [void][Windows.Forms.MessageBox]::Show($form, 'Your own server is host:port, e.g. 192.168.1.20:39420.', 'OpenSmash', 'OK', 'Warning')
         return
     }
     try { Save-WindowValues $before (Get-WindowValues) } catch {
-        [void][Windows.Forms.MessageBox]::Show($form, "The settings could not be saved: $($_.Exception.Message)", 'WindowSmash', 'OK', 'Error')
+        [void][Windows.Forms.MessageBox]::Show($form, "The settings could not be saved: $($_.Exception.Message)", 'OpenSmash', 'OK', 'Error')
         return
     }
     $script:played = $true

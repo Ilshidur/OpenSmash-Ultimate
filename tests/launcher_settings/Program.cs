@@ -47,6 +47,7 @@ static class Tests
         try
         {
             Lobby();
+            OnlineRules(Path.Combine(root, "online"));
             FreshFolder(Path.Combine(root, "fresh"));
             GameChangesKept(Path.Combine(root, "game"));
             SameFilesAsTheGame(Path.Combine(root, "sync"));
@@ -56,6 +57,7 @@ static class Tests
             Presence(Path.Combine(root, "presence"));
             ShaderRebuild(Path.Combine(root, "shaders"));
             UpdateChannel().GetAwaiter().GetResult();
+            GameRestart(Path.Combine(root, "restart"));
             // (a real SDL3.dll, when one is given: it loads and lists the pads, none needed)
             string? sdl = Environment.GetEnvironmentVariable("LAUNCHER_TEST_SDL_DIR");
             if (!string.IsNullOrEmpty(sdl))
@@ -153,23 +155,95 @@ static class Tests
         foreach (var region in OpenSmash.Core.ServerRegion.All)
         {
             Check(SettingDefaults.LobbyFromLine(region.Lobby).Lobby == "auto" && SettingDefaults.LobbyFromLine(region.Lobby + " mine").Lobby == "private", $"{region.Lobby} reads as the official lobby");
-            Check(SettingDefaults.Choices["region"].Contains(region.Id) && SettingDefaults.RegionLabels.Contains(region.Label), $"{region.Id} is a choice of the page");
+            Check(SettingDefaults.Choices["region"].Contains(region.Id), $"{region.Id} is a choice of the page");
         }
-        Check(SettingDefaults.Choices["region"][0] == "auto" && SettingDefaults.Choices["region"].Length == SettingDefaults.RegionLabels.Length && SettingDefaults.OfFile("server_region.txt") == "auto", "Auto first, and the default");
+        // (our regions only, by their names; "auto" stays the game's own default in the file)
+        Check(SettingDefaults.Choices["region"].SequenceEqual(new[] { "eu", "na-east", "sa" }) && SettingDefaults.RegionLabels.SequenceEqual(new[] { "Europe", "North America East", "South America" })
+              && SettingDefaults.OfFile("server_region.txt") == "auto", "Server region: Europe, North America East and South America");
         string install = Path.Combine(Path.GetTempPath(), "opensmash-region-" + Guid.NewGuid().ToString("n"));
         Directory.CreateDirectory(Path.Combine(install, "config"));
         try
         {
-            Check(SettingDefaults.RegionShown(install, "auto") == null && SettingDefaults.RegionShown(install, "eu") == null, "Auto not measured, a region chosen: the list's own label");
+            Check(SettingDefaults.RegionShown(install, "eu") == null && OpenSmash.Core.OnlineSettings.RegionShown(install) == "eu", "no region chosen, nothing measured: Europe");
             File.WriteAllText(Path.Combine(install, "config", "server_region_auto.txt"), "na-east 23 1700000000\n");
-            Check(SettingDefaults.RegionShown(install, "auto") == "Auto (NA East, 23 ms)" && SettingDefaults.RegionShown(install, "eu") == null, "Auto shown with its pick and ping");
-            File.WriteAllText(Path.Combine(install, "config", "server_region_auto.txt"), "eu\n");
-            Check(SettingDefaults.RegionShown(install, "auto") == "Auto (EU)", "Auto's pick without a time");
+            Check(OpenSmash.Core.OnlineSettings.RegionShown(install) == "na-east", "auto: the region it plays on (its pick)");
+            OpenSmash.Core.ServerRegion.SetSetting(install, "eu");
+            Check(OpenSmash.Core.OnlineSettings.RegionShown(install) == "eu" && OpenSmash.Core.OfficialLobby.Current(install) == OpenSmash.Core.ServerRegion.ById("eu").Lobby, "a chosen region over the pick, and its lobby is the one played on");
+            OpenSmash.Core.ServerRegion.SetSetting(install, "na-east");
+            Check(OpenSmash.Core.OnlineSettings.RegionShown(install) == "na-east" && OpenSmash.Core.OfficialLobby.Current(install) == "na.lobby.opensmashultimate.com:39421", "North America East chosen: its lobby");
             File.WriteAllText(Path.Combine(install, "config", "official_lobby.txt"), "lobby.example:39421\n");
             Check(SettingDefaults.RegionShown(install, "auto") == "lobby.example:39421" && SettingDefaults.RegionShown(install, "eu") == "lobby.example:39421", "an install's own official server is shown instead");
         }
         finally { try { Directory.Delete(install, true); } catch (IOException) { } }
         Check(SettingDefaults.Renderer("d3d11") == "auto" && SettingDefaults.Renderer("DX11") == "direct3d11" && SettingDefaults.Renderer("vk") == "vulkan", "renderer names as runtime/renderer.h");
+    }
+
+    // The Online rows (OpenSmash.Core.OnlineSettings): the official lobby hides AND resets the lobby code, the server of
+    // one's own and Direct connections (off), here and in launcher.ini's remembered copy; a server of one's own shows them
+    // again, empty, Direct connections back on; nothing half-typed reaches online_server.txt; the server region is Europe
+    // or North America East, saved, read back after a restart and the lobby played on. Old files' leftovers included.
+    static void OnlineRules(string repo)
+    {
+        string config = Path.Combine(repo, "config");
+        Directory.CreateDirectory(config);
+        File.WriteAllText(Path.Combine(config, "version.ini"), "version = 1\n");
+        string server = Path.Combine(config, "online_server.txt"), direct = Path.Combine(config, "online_direct.txt"), ini = Path.Combine(config, "launcher.ini");
+        File.WriteAllText(server, "auto\n");
+        File.WriteAllText(direct, "on\n");
+        File.WriteAllText(ini, "[opensmash]\ncode = oldcode\nserver = my.host:39420\n");   // (an older launcher's leftovers)
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        string IniOf(string key) => File.ReadAllLines(ini).Select(l => l.Split('=')).Where(p => p.Length == 2 && p[0].Trim() == key).Select(p => p[1].Trim()).FirstOrDefault() ?? "";
+        var (form, call, values) = Open(repo);
+        using (form)
+        {
+            void Write(string key, string value) => typeof(LauncherForm).GetMethod("WriteSetting", flags)!.Invoke(form, new object[] { key, value });
+            var settings = (Setting[])typeof(LauncherForm).GetField("_settings", flags)!.GetValue(form)!;
+            bool On(string key) => (bool)typeof(LauncherForm).GetMethod("SettingOn", flags)!.Invoke(form, new object[] { settings.First(x => x.Key == key) })!;
+            call("ReadSettings");
+            Check(values["lobby"] == "auto" && values["code"] == "" && values["server"] == "" && values["direct"] == "off",
+                  "official lobby: an old launcher.ini's code and server and an online_direct.txt 'on' are not shown");
+            Check(!On("code") && !On("server") && !On("direct") && On("region") && On("name"), "official lobby: only the name and the server region are shown");
+            Check(File.ReadAllText(server) == "auto\n" && File.ReadAllText(direct) == "on\n", "reading writes nothing");
+            Write("lobby", "custom");
+            Check(values["code"] == "" && values["server"] == "" && values["direct"] == "on" && On("code") && On("server") && On("direct") && !On("region"),
+                  "your own server: code, server and direct connections shown again, empty, direct on");
+            Check(File.ReadAllText(server) == "auto\n", "your own server without its address: online_server.txt keeps the last complete choice (no made-up 127.0.0.1)");
+            Check(IniOf("code") == "" && IniOf("server") == "", "launcher.ini's stale code and server reset");
+            Write("server", "my.host:39420");
+            Check(File.ReadAllText(server).Trim() == "my.host:39420", "the server written once it is host:port");
+            Write("code", "abc");
+            Check(File.ReadAllText(server).Trim() == "my.host:39420 abc" && IniOf("code") == "abc", "with its code");
+            Write("lobby", "auto");
+            Check(values["code"] == "" && values["server"] == "" && values["direct"] == "off" && File.ReadAllText(server).Trim() == "auto"
+                  && File.ReadAllText(direct).Trim() == "off" && IniOf("code") == "" && IniOf("server") == "",
+                  "back to the official lobby: code and server reset everywhere, direct connections off");
+            Write("region", "na-east");
+            Check(OpenSmash.Core.ServerRegion.Setting(repo) == "na-east" && OpenSmash.Core.OfficialLobby.Current(repo) == "na.lobby.opensmashultimate.com:39421",
+                  "North America East picked: saved, and its lobby is the one played on");
+        }
+        var (form2, call2, values2) = Open(repo);   // (a restart)
+        using (form2)
+        {
+            void Write(string key, string value) => typeof(LauncherForm).GetMethod("WriteSetting", flags)!.Invoke(form2, new object[] { key, value });
+            call2("ReadSettings");
+            Check(values2["lobby"] == "auto" && values2["region"] == "na-east" && values2["code"] == "" && values2["server"] == "", "after a restart: the official lobby, North America East, nothing stale");
+            Write("region", "eu");
+            Check(File.ReadAllText(Path.Combine(config, "server_region.txt")).Trim() == "eu" && OpenSmash.Core.OfficialLobby.Current(repo) == OpenSmash.Core.ServerRegion.ById("eu").Lobby, "Europe picked: saved and played on");
+            Write("lobby", "private");
+            Check(values2["code"] == "" && values2["direct"] == "off" && File.ReadAllText(server).Trim() == "auto", "private lobby: an empty code, nothing written until it is typed");
+            Write("code", "friends1");
+            Check(File.ReadAllText(server).Trim() == SettingDefaults.PublicLobby + " friends1", "private lobby with its code");
+            Write("lobby", "lan");
+            Check(File.ReadAllText(server).Trim() == "lan" && values2["direct"] == "on" && File.ReadAllText(direct).Trim() == "on", "LAN: direct connections back on");
+            Write("lobby", "auto");
+            Write("lobby", "custom");
+            Write("lobby", "auto");
+            Check(File.ReadAllText(server).Trim() == "auto" && values2["code"] == "" && values2["server"] == "" && File.ReadAllText(direct).Trim() == "off", "back and forth: the official lobby, consistent");
+        }
+        File.WriteAllText(server, "");   // (an online_server.txt without a line: the official lobby)
+        Check(OpenSmash.Core.OnlineSettings.EnsureLine(server) && File.ReadAllText(server).Trim() == "auto" && !OpenSmash.Core.OnlineSettings.EnsureLine(server), "an empty online_server.txt becomes the official lobby, once");
+        File.WriteAllText(server, "# the player's\noff\n");
+        Check(!OpenSmash.Core.OnlineSettings.EnsureLine(server) && File.ReadAllText(server) == "# the player's\noff\n", "an explicit choice (offline) is kept");
     }
 
     static (LauncherForm Form, Func<string, object?> Call, Dictionary<string, string> Values) Open(string repo)
@@ -196,9 +270,12 @@ static class Tests
             foreach (var row in SettingDefaults.Table.Where(r => r.Key != ""))
                 Check(values[row.Key] == row.Default || (row.Key == "renderer" && values[row.Key] == SettingDefaults.Renderer(row.Default)),
                       $"fresh: {row.Key} shows the game's default {row.Default} (shows {values.GetValueOrDefault(row.Key)})");
-            Check(values["lobby"] == "offline" && values["direct"] == "on" && values["name"] == "", "fresh: no online files is offline, direct on");
+            // (the official lobby is the launchers' default: an unset online_server.txt is written "auto", nothing else)
+            Check(values["lobby"] == "auto" && values["direct"] == "off" && values["code"] == "" && values["server"] == "" && values["name"] == "", "fresh: no online file is the official lobby, direct off");
             call("PersistSettings");
-            Check(Files(repo).Length == 0, "fresh: closing writes no file (" + string.Join(", ", Files(repo)) + ")");
+            Check(Files(repo).SequenceEqual(new[] { "online_server.txt" }) && File.ReadAllText(Path.Combine(repo, "online_server.txt")).Trim() == "auto",
+                  "fresh: only the official lobby's line is written (" + string.Join(", ", Files(repo)) + ")");
+            File.Delete(Path.Combine(repo, "online_server.txt"));
         }
         File.WriteAllText(Path.Combine(repo, "online_server.txt"), "# comment\nauto\n");   // (what the download comes with)
         var (form2, call2, values2) = Open(repo);
@@ -300,11 +377,11 @@ static class Tests
             Check(values["lobby"] == "private", "a change made here and not written yet is kept");
             Check(File.ReadAllText(Path.Combine(config, "online_server.txt")) == "auto\n", "the unwritten lobby still not written");
             File.SetLastWriteTimeUtc(display, DateTime.UtcNow.AddSeconds(5));
-            File.WriteAllText(Path.Combine(config, "online_direct.txt"), "on\n");
-            File.SetLastWriteTimeUtc(Path.Combine(config, "online_direct.txt"), DateTime.UtcNow.AddSeconds(10));
-            values["direct"] = "off";   // (a stale copy: only a reload puts it right)
+            File.WriteAllText(Path.Combine(config, "online_name.txt"), "Rel\n");
+            File.SetLastWriteTimeUtc(Path.Combine(config, "online_name.txt"), DateTime.UtcNow.AddSeconds(10));
+            values["name"] = "stale";   // (a stale copy: only a reload puts it right)
             call("ReloadSettingsIfChanged");
-            Check(values["direct"] == "on", "read again on each change");
+            Check(values["name"] == "Rel", "read again on each change");
             call("PersistSettings");
             Check(File.ReadAllText(display).Contains("window = fullscreen") && File.ReadAllText(display).Contains("renderer = vulkan"), "closing keeps the menu's choices");
         }
@@ -404,6 +481,31 @@ static class Tests
                 RequestMessage = new HttpRequestMessage(request.Method, new Uri("https://github.com" + PageLands)),
             });
         }
+    }
+
+    // A game started again from its settings (runtime/hle_settings.c settings_restart) is a new process with the same output,
+    // after the first has ended: its lines go on into play.log, and the game's end (GameFolder.Ended, where the launcher
+    // sends a crash report) is the restarted game's. (proc's Exited came with the first's: the report was looked for, and
+    // play.log read, at "[settings] starting the game again".) A made-up game: cmd scripts, the second started by the first.
+    static void GameRestart(string dir)
+    {
+        Directory.CreateDirectory(dir);
+        string first = Path.Combine(dir, "first.cmd"), second = Path.Combine(dir, "second.cmd"), log = Path.Combine(dir, "play.log");
+        File.WriteAllText(first, "@echo [settings] starting the game again\r\n@start \"\" /b cmd /d /c \"" + second + "\"\r\n");
+        File.WriteAllText(second, "@ping -n 4 127.0.0.1 >nul\r\n@echo [boot] started again\r\n@echo *** host exception (made up)\r\n");
+        var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe")
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (string a in new[] { "/d", "/c", first }) psi.ArgumentList.Add(a);
+        using var proc = GameFolder.StartLogged(psi, log);
+        Check(proc != null && proc.WaitForExit(15000), "restart: the first process ends at once");
+        var ended = GameFolder.Ended(proc!);
+        Check(!ended.Wait(300), "restart: the game has not ended with its first process");
+        Check(ended.Wait(30000), "restart: the game ends with the one started again");
+        string text = File.ReadAllText(log);
+        Check(text.Contains("starting the game again") && text.Contains("started again") && text.Contains("*** host exception (made up)"),
+            "restart: the restarted game's lines are in the log at its end: " + text);
     }
 
     // The update check's release channel and the verdict after an update (Discord "Can't update", 2026-11-18): GitHub not

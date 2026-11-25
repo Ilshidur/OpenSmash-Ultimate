@@ -23,7 +23,7 @@ public sealed partial class ClassicSurface
             ["overlay"] = "The frame rate in the corner. F1 shows or hides it while playing.",
             ["volume"] = "The game's whole sound (display.ini volume, the same setting as the in-game menu's Volume row). 100 is full. It applies the next time you press Play.",
             ["name"] = "What other players see. Leave it empty and the game picks one.",
-            ["lobby"] = "Public: everyone's rooms. Private: only players with the same code. Offline: no network.",
+            ["lobby"] = "Official lobby: your region's server, every match relayed. Private: only players with the same code. LAN: players on this network. Offline: no network.",
             ["code"] = "A word your friends type too. Capital letters count.",
             ["server"] = "host:port of a lobby you run, for example 192.168.1.20:39420.",
             ["direct"] = "On is faster. Off sends everything through the lobby, so your address stays private.",
@@ -413,6 +413,8 @@ public sealed partial class ClassicSurface
             string message = string.IsNullOrEmpty(_updateMessage) ? "Check GitHub for a newer version of OpenSmash. Play is paused while an update installs." : _updateMessage;
             ArtworkTheme.DrawWrapped(g, message, FB(15 * s), A(ArtworkTheme.Muted), x + pad, ty, cwIn - pad * 2, 64 * s);
             if (!string.IsNullOrEmpty(_updateDetail)) ArtworkTheme.DrawWrapped(g, _updateDetail, FB(13 * s), A(ArtworkTheme.Dim), x + pad, ty + 70 * s, cwIn - pad * 2, 54 * s);
+            // (the three versions a report asks for: OpenSmash.Core.VersionInfo; the game's Esc menu shows them too)
+            if (Project != null) ArtworkTheme.Label(g, OpenSmash.Core.VersionInfo.Line(Project.Root), FM(12 * s), A(ArtworkTheme.Dim), x + pad, listTop + ch - 110 * s, 16 * s, 12 * s * 0.08f);
             if (_updateLocal.Length > 0 || _updateHead.Length > 0)
             {
                 Font vf = FM(12 * s);
@@ -751,7 +753,7 @@ public sealed partial class ClassicSurface
 
             {
                 var st = PushReveal(g, 0);
-                ArtworkTheme.DrawWrapped(g, "The community plugins movesets and new characters are built on. Downloading them here is the same list WindowSmash Mods keeps under Settings.",
+                ArtworkTheme.DrawWrapped(g, "The community plugins movesets and new characters are built on. Downloading them here is the same list OpenSmash Mods keeps under Settings.",
                     FB(16 * s), A(ArtworkTheme.Muted), x, ContentTop * s - 4 * s, cw, 52 * s);
                 PopFade(g, st);
             }

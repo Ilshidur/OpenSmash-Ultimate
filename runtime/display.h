@@ -88,6 +88,19 @@ int display_pacing_vrr(void);
 int display_present_odd_rate(void);
 /* The vsync thread: returns when the next refresh the game sees is due. */
 void display_wait_tick(void);
+/* frame_rate = 60 | 120 | 240 (display.ini, SSBU_FRAME_RATE; the settings menu changes it at once): how many times a
+ * second the game's main loop runs, draws and reads the controllers; its logic stays at 60 a second (hle_frame_rate.c). */
+int display_frame_rate(void);
+void display_set_frame_rate(int fps);
+/* The game's refreshes in a 60 Hz frame now: frame_rate / 60, but 1 while a networked match is set up or under way, with
+ * SSBU_SPEED and with run-ahead (each counts one main-loop pass a logic frame). display_tick_mult: the one the vsync
+ * thread's last display_wait_tick paced (what the game is shown now). */
+int display_refresh_mult(void);
+int display_tick_mult(void);
+/* motion = off | interpolate | extrapolate (display.ini, SSBU_MOTION; the settings menu changes it at once): with
+ * frame_rate above 60, the pictures between two logic frames drawn with the motion blended (gpu_motion.c). 0, 1, 2. */
+int display_motion(void);
+void display_set_motion(int mode);
 /* SSBU_SPEED (test runs): 1 = normal; else the vsync thread gives one refresh per frame shown,
  * n x 60 a second (display_speed_tick waits for the next one's time), 0 = uncapped. */
 double display_speed(void);
@@ -120,3 +133,12 @@ int display_uw_online_saved(void);   /* the one saved for the next start */
 void display_set_uw_online(int on);
 void display_set_renderer(int renderer);      /* (the same: RENDERER_*, which back end draws from the next start) */
 void display_set_gpu(const char *gpu);          /* (the same: the graphics card, "auto" or its name, picked at the next start) */
+
+/* The GPU's time per frame shown (ipc_vi.c keeps them; the renderers' timestamp queries hand them over a few frames
+ * late, never waiting for them; SSBU_GPU_TIMESTAMPS=0: not measured). Measuring only: low_latency's once-a-minute
+ * line says them. end_qpc and submit_qpc (QueryPerformanceCounter): the work's end on the CPU's clock and the submit
+ * of its last part, both 0 when the renderer cannot put the GPU's clock on the CPU's (Direct3D 11). */
+int gpu_timestamps_on(void);
+void gpu_frame_time_push(double work_ms, long long submit_qpc, long long end_qpc);
+double gpu_frame_ms_last(void);                    /* the last frame timed, ms; -1 before any */
+int gpu_frame_ms_stats(double *p50, double *p95);  /* the last 120 frames timed: their count, p50 and p95 in ms */

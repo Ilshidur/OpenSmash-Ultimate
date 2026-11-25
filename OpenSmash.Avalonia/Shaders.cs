@@ -7,6 +7,9 @@ public sealed partial class MainWindow
     CancellationTokenSource? _shaderCancel;
     bool ShadersDone()
     {
+        // macOS draws with Metal, which makes its own cache as it plays: tools/shader_aot.py prepares Direct3D 11 / Vulkan
+        // programs (fxc on Windows, vkd3d-shader on Linux) and has nothing to do there (#542).
+        if(OperatingSystem.IsMacOS())return true;
         var p=RequireProject();string marker=p.PathIn("dump","shadercache","complete.txt"),header=p.PathIn("runtime","gpu_shader_cache.h");
         if(!File.Exists(marker)||!File.Exists(header))return false;
         string source=File.ReadAllText(header),text=File.ReadAllText(marker);
@@ -16,11 +19,23 @@ public sealed partial class MainWindow
         var spv=Regex.Match(source,@"#define SHADER_CACHE_SPV_VERSION \(SHADER_CACHE_VERSION \* 100 \+ (\d+)\)");
         string want=spv.Success?"\nspirv g"+(int.Parse(version.Groups[1].Value)*100+int.Parse(spv.Groups[1].Value))+".":"\nspirv ";
         string renderer=Surface.GetSetting("renderer");
-        return renderer=="direct3d11"||!File.Exists(p.PathIn("build","ssbu_glslang.dll"))||text.Contains(want);
+        // Auto may fall back from Vulkan to Direct3D 11 on Windows: its programs must be this DXBC revision's too (#567),
+        // so only an explicit Vulkan, or a system with no Direct3D, asks for the SPIR-V alone.
+        if(renderer!="direct3d11"&&File.Exists(p.PathIn("build","ssbu_glslang.dll")))
+        {
+            if(!text.Contains(want))return false;
+            if(renderer=="vulkan"||!OperatingSystem.IsWindows())return true;
+        }
+        var dxbc=Regex.Match(source,@"#define SHADER_CACHE_DXBC_VERSION \(SHADER_CACHE_VERSION \* 100 \+ (\d+)\)");
+        return !dxbc.Success||Regex.IsMatch(text,@"(?m)^dxbc v"+(int.Parse(version.Groups[1].Value)*100+int.Parse(dxbc.Groups[1].Value))+@"\r?$");
     }
     async Task AskShaders()
     {
         if(_closed||_project?.IsBuilt!=true||ShadersDone()||Surface.HasPrompt||_shaderCancel!=null)return;
+        // As the Windows launcher (LauncherForm.AskShadersIfNeeded): prepared in the background at low priority, not asked -
+        // a player who answered "later" played with every shader made at its first draw (menus and first matches stutter).
+        // tools/shader_aot.py pauses while the game runs and resumes where it stopped. OPENSMASH_SHADERS_AUTO=0: asked, as before.
+        if(Environment.GetEnvironmentVariable("OPENSMASH_SHADERS_AUTO")!="0"){_=CompileShaders("low");return;}
         string priority=await Surface.ShowShaderPrompt();
         if(priority is "low" or "medium" or "high")_=CompileShaders(priority);
     }

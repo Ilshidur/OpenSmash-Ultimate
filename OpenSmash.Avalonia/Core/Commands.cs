@@ -17,6 +17,7 @@ public sealed record Command(string Executable, IReadOnlyList<string> Arguments,
         foreach (string argument in Arguments) info.ArgumentList.Add(argument);
         info.Environment["PYTHONIOENCODING"] = "utf-8";
         info.Environment["PYTHONUNBUFFERED"] = "1";
+        info.Environment[OpenSmash.Core.VersionInfo.EnvName] = OpenSmash.Core.VersionInfo.Launcher;   // (the game's Esc menu shows it)
         if (Environment != null) foreach (var entry in Environment) info.Environment[entry.Key] = entry.Value;
         return info;
     }
@@ -39,7 +40,7 @@ public static class Commands
     {
         if(p.Platform==DesktopPlatform.Windows)
         {
-            var args=new List<string>{"-NoProfile","-ExecutionPolicy","Bypass","-File",p.PathIn("tools","install_windowsmash.ps1"),
+            var args=new List<string>{"-NoProfile","-ExecutionPolicy","Bypass","-File",p.Installer,
                 "-NoWizard","-Game",options.Game,"-Keys",options.Keys,"-OnlineName",options.Name,"-Jobs",options.Jobs.ToString()};
             if(options.Firmware=="")args.Add("-NoFirmware");else args.AddRange(["-Firmware",options.Firmware]);
             if(options.Shortcuts)args.Add("-Shortcut");if(options.Firewall)args.Add("-Firewall");if(options.Shaders)args.Add("-Shaders");

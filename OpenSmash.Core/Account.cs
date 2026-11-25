@@ -120,6 +120,8 @@ namespace OpenSmash.Core
             Service = service ?? AccountService.Load(root);
             string dir = Path.Combine(root ?? Path.GetDirectoryName(Updater.ExePath), "config");
             sessionFile = Path.Combine(dir, "session.dat");
+            // (#507) some hosts in front of the accounts server refuse requests without a User-Agent
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("OpenSmash-Launcher/" + Updater.Current);
         }
 
         /// <summary>the last session of this PC: refreshed and its profile read. false (no exception) when there is none or
@@ -246,11 +248,19 @@ namespace OpenSmash.Core
         /// <summary>a public read with the publishable key only</summary>
         public Task<string> AnonAsync(string path) => RequestAsync("GET", path, null, Service.Key);
 
+        /// <summary>a public RPC with the publishable key only (POST /rest/v1/rpc/&lt;name&gt;): the answer's text</summary>
+        public Task<string> AnonRpcAsync(string name, string body) => RequestAsync("POST", "/rest/v1/rpc/" + name, body ?? "{}", Service.Key);
+
         public async Task<string> AccessTokenAsync() { await EnsureAccessAsync(); return access; }
 
         async Task EnsureAccessAsync()
         {
             if (access != null && DateTime.UtcNow < accessUntil) return;
+            // (another program of this user may have renewed the session since: the launcher's --online-pass, which
+            // Play SSBU and the web launcher start. Supabase rotates refresh tokens and can end a session whose old
+            // token is used again, so a token in the file that this program did not write is the newer one)
+            string onDisk = LoadRefresh(false);
+            if (onDisk != null && onDisk != sessionSeen) { refresh = onDisk; sessionSeen = onDisk; }
             if (refresh == null) throw new AccountException("Not signed in.");
             await TokenAsync("refresh_token", new Dictionary<string, string> { ["refresh_token"] = refresh });
         }
@@ -302,7 +312,10 @@ namespace OpenSmash.Core
             if (body != null) rq.Content = new StringContent(body, Encoding.UTF8, "application/json");
             HttpResponseMessage rs;
             try { rs = await http.SendAsync(rq); }
-            catch (Exception e) when (e is HttpRequestException || e is TaskCanceledException) { throw new AccountException("Cannot reach the accounts server: " + e.Message); }
+            catch (Exception e) when (e is HttpRequestException || e is TaskCanceledException)
+            {   // (#507) the inner exception names the real cause (DNS, TLS, refused)
+                throw new AccountException("Cannot reach the accounts server: " + e.Message + (e.InnerException != null ? " (" + e.InnerException.Message + ")" : ""));
+            }
             using (rs)
             {
                 string text = await rs.Content.ReadAsStringAsync();
@@ -320,6 +333,8 @@ namespace OpenSmash.Core
         // ---- the session, for this user only -------------------------------------------------------------------------
         static readonly byte[] Entropy = Encoding.ASCII.GetBytes("opensmash session");
 
+        string sessionSeen;   // the refresh token this program last wrote to the session file or read from it
+
         void SaveRefresh(string token)
         {
             try
@@ -334,11 +349,12 @@ namespace OpenSmash.Core
                     File.SetUnixFileMode(sessionFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
                     File.WriteAllBytes(sessionFile, data);
                 }
+                sessionSeen = token;
             }
             catch { }
         }
 
-        string LoadRefresh()
+        string LoadRefresh(bool seen = true)
         {
             try
             {
@@ -346,7 +362,9 @@ namespace OpenSmash.Core
                 byte[] b = File.ReadAllBytes(sessionFile);
                 if (OperatingSystem.IsWindows()) b = ProtectedData.Unprotect(b, Entropy, DataProtectionScope.CurrentUser);
                 string t = Encoding.UTF8.GetString(b).Trim();
-                return t.Length > 0 ? t : null;
+                if (t.Length == 0) return null;
+                if (seen) sessionSeen = t;
+                return t;
             }
             catch { return null; }
         }

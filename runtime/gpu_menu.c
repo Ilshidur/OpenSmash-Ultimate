@@ -158,6 +158,7 @@ enum {
     R_LOBBY, R_MATCH_FIND, R_MATCH_CANCEL, R_ROOMS,
     R_UI_LANGUAGE, R_LANGUAGE, R_VOLUME, R_UW_ONLINE, R_OPEN_LOGS, R_RESTART, R_QUIT, R_REMAP_BACK, R_MODS_STATE, R_MOD_CODE, R_MODS_OFF, R_LAN_ROOMS,
     R_KEYS, R_KEYS_BACK, R_KEYS_RESET, R_RENDERER, R_ROOMS_PREV, R_ROOMS_NEXT, R_ROOMS_GAME_PAGE, R_RUNAHEAD, R_NET_ROLLBACK, R_NET_DELAY, R_NET_REGION,
+    R_FRAMERATE, R_MOTION,
     R_PADSEL_FIRST = 300, /* + the controller's place (PAD_SLOTS at most): opens its settings */
     R_REMAP_FIRST = 100,  /* + console button */
     R_MOD_FIRST = 200,    /* + the mod's place in mods.json (MENU_MODS at most) */
@@ -167,7 +168,7 @@ enum {
     R_ASSIGN, R_ASSIGN_BACK, R_ASSIGN_WAIT, R_REMAP_RESET, R_STICKS_RESET, R_RUMBLE_RESET, R_CTRLS, R_CTRLS_BACK,
     R_ROOM_FIRST = 600    /* + the room's place on the page of rooms shown (ROOM_PAGE at most); the plain ids before R_REMAP_FIRST (100) stay under it */
 };
-_Static_assert(R_NET_REGION < R_REMAP_FIRST, "the plain row ids must stay under R_REMAP_FIRST");
+_Static_assert(R_MOTION < R_REMAP_FIRST, "the plain row ids must stay under R_REMAP_FIRST");
 #define IS_KEY(id) ((id) >= R_KEY_FIRST && (id) < R_KEY_FIRST + PAD_KEYS)
 #define IS_REMAP(id) ((id) >= R_REMAP_FIRST && (id) < R_REMAP_FIRST + 16)
 
@@ -237,7 +238,7 @@ static int trigger_default(const PadInfo *p) { return pad_is_gc(p) ? GC_TRIGGER_
 static char pins[PAD_SLOTS][128]; /* controllers.ini's [players], read at the menu's opening and changes */
 static int rumble_slot = -1;
 static ULONGLONG rumble_stop;
-static char version[64];
+static char version[64], source_version[64], launcher_version[64];   /* (the Info page: the game's, the recomp sources', the launcher's) */
 static char gpus[8][64];
 static int ngpus;
 static int wheel_free_sel = -1, wheel_free_page = -1; /* the wheel moved the view off the cursor: the row it left, so drawing does not pull the view back */
@@ -253,7 +254,7 @@ static struct { int mode; char custom[128], code[40], name[40]; int direct, prot
 enum { NET_PUBLIC, NET_PRIVATE, NET_CUSTOM, NET_OFFLINE, NET_LAN, NET_MODE_COUNT };
 /* (the first choice is the official lobby: relay only, one server a region - net_region.c. OpenSmash 0.5.0: Epic Online
  * Services are gone, and an "eos" line in online_server.txt reads as the official lobby, net_relay.c) */
-static const char *const NET_MODES[NET_MODE_COUNT] = {"official lobby (relay only, EU / NA East)", "private lobby (a code)", "your own server", "offline",
+static const char *const NET_MODES[NET_MODE_COUNT] = {"official lobby (relay only, EU / NA East / SA)", "private lobby (a code)", "your own server", "offline",
                                                       "this network (LAN)"};
 
 static void net_load(void)
@@ -304,18 +305,56 @@ static void net_save_server(void)
     settings_line_write(config_path(CONFIG_ONLINE_SERVER), line);
 }
 
-static void load_version(void)
+/* the first line of <the port's folder>/<rel>, or "" */
+static void first_line(const char *rel, char *out, size_t size)
 {
     char path[600];
-    snprintf(path, sizeof path, "%s/../../version.txt", rt_data_dir ? rt_data_dir : ".");
-    version[0] = 0;
+    snprintf(path, sizeof path, "%s/../../%s", rt_data_dir ? rt_data_dir : ".", rel);
+    out[0] = 0;
     FILE *f = fopen(path, "r");
     if (f)
     {
-        if (fgets(version, sizeof version, f))
-            version[strcspn(version, "\r\n")] = 0;
+        if (fgets(out, (int)size, f))
+            out[strcspn(out, "\r\n")] = 0;
         fclose(f);
     }
+}
+
+static int hex40(const char *t)
+{
+    int n = 0;
+    while (n < 40 && ((t[n] >= '0' && t[n] <= '9') || (t[n] >= 'a' && t[n] <= 'f') || (t[n] >= 'A' && t[n] <= 'F'))) n++;
+    return n == 40;
+}
+
+static void load_version(void)
+{
+    first_line("version.txt", version, sizeof version);
+    /* the recomp's sources: tools/source_version.txt "<commit> <date>" (a release ZIP and the updater write it); in a git
+     * checkout (still "$Format..."), .git/HEAD's commit, or its branch's */
+    char line[128];
+    first_line("tools/source_version.txt", line, sizeof line);
+    source_version[0] = 0;
+    if (hex40(line))
+        snprintf(source_version, sizeof source_version, "%.7s%s", line, line[40] == ' ' ? line + 40 : "");
+    else
+    {
+        first_line(".git/HEAD", line, sizeof line);
+        if (hex40(line))
+            snprintf(source_version, sizeof source_version, "%.7s (git)", line);
+        else if (!strncmp(line, "ref: refs/heads/", 16))
+        {
+            char ref[160], sha[64];
+            snprintf(ref, sizeof ref, ".git/%s", line + 5);
+            first_line(ref, sha, sizeof sha);
+            if (hex40(sha))
+                snprintf(source_version, sizeof source_version, "%.7s (git, %.40s)", sha, line + 16);
+            else
+                snprintf(source_version, sizeof source_version, "git, %.40s", line + 16);
+        }
+    }
+    const char *lv = getenv("OPENSMASH_LAUNCHER_VERSION");   /* (the launchers set it at Play: OpenSmash.Core.VersionInfo.EnvName) */
+    snprintf(launcher_version, sizeof launcher_version, "%s", lv && *lv ? lv : "");
 }
 
 static void load_pins(void);
@@ -458,7 +497,7 @@ static void lan_row(int looking)
             snprintf(r->value + strlen(r->value), sizeof r->value - strlen(r->value), ui_text(" (and %d of another version)"), others);
         help_set(r, "Private rooms hosted on this network by games of your version, heard now. The game joins the first one by itself "
                     "(Online > Now says which), and the next one if that host leaves.%s",
-                 others ? "\nThe others are of another game or WindowSmash version, or of another room code: they can't be joined." : "");
+                 others ? "\nThe others are of another game or OpenSmash version, or of another room code: they can't be joined." : "");
     }
     else if (lan == NET_LAN_ANNOUNCING)
     {
@@ -535,7 +574,7 @@ static void match_rows(void)
             snprintf(r->value, sizeof r->value, "asking the lobby...");
         else
             snprintf(r->value, sizeof r->value, "searching... %d:%02d", waited / 60, waited % 60);
-        help_set(r, "Searching for another player of your game, WindowSmash and mods, with your lobby code. You can close this menu "
+        help_set(r, "Searching for another player of your game, OpenSmash and mods, with your lobby code. You can close this menu "
                     "and play meanwhile: a message says when a match is found.");
         break;
     case NET_MATCH_MATCHED:
@@ -559,7 +598,7 @@ static void match_rows(void)
         break;
     case NET_MATCH_TIMEOUT:
         snprintf(r->value, sizeof r->value, "no opponent found in time");
-        help_set(r, "Nobody of your game, WindowSmash, mods and lobby code searched in time. A: search again.");
+        help_set(r, "Nobody of your game, OpenSmash, mods and lobby code searched in time. A: search again.");
         break;
     case NET_MATCH_LEFT:
         snprintf(r->value, sizeof r->value, "%.32s cancelled or left", other);
@@ -575,7 +614,7 @@ static void match_rows(void)
         break;
     default:
         snprintf(r->value, sizeof r->value, "not searching");
-        help_set(r, "Pairs you with another player of your game, WindowSmash and mods, with your lobby code, and says who hosts. A: "
+        help_set(r, "Pairs you with another player of your game, OpenSmash and mods, with your lobby code, and says who hosts. A: "
                     "search. You can close this menu meanwhile: a message says when a match is found.");
     }
     if (m->state == NET_MATCH_ASKING || m->state == NET_MATCH_SEARCHING || m->state == NET_MATCH_MATCHED)
@@ -668,7 +707,7 @@ static const char *room_short(const NetRoom *x)
     if (x->why_kind == NET_WHY_BUILD)
         return "another game version";
     if (x->why_kind == NET_WHY_SIM)
-        return x->sim > SIM_VERSION ? "update your WindowSmash" : "their WindowSmash is older";
+        return x->sim > SIM_VERSION ? "update your OpenSmash" : "their OpenSmash is older";
     return "other mods";
 }
 
@@ -706,7 +745,7 @@ static void room_rows(void)
         if (!x->joinable)
         {
             snprintf(r->value, sizeof r->value, ui_text("can't join: %s"), room_short(x));
-            help_set(r, "%s%s\n%s", x->why, x->why_kind != NET_WHY_SIM ? "" : x->sim > SIM_VERSION ? "\nYours is the older one: update WindowSmash to join."
+            help_set(r, "%s%s\n%s", x->why, x->why_kind != NET_WHY_SIM ? "" : x->sim > SIM_VERSION ? "\nYours is the older one: update OpenSmash to join."
                                                                                                    : "\nTheirs is the older one: the host needs to update.",
                      x->details);
             continue;
@@ -818,7 +857,7 @@ static void build_lobby(int fresh)
             snprintf(r->value, sizeof r->value, ui_text(match.players == 1 ? "%d player, %d searching" : "%d players, %d searching"), match.players, match.searching);
         else
             snprintf(r->value, sizeof r->value, ui_text("version 3"));
-        r->help = "The players of your lobby code who can play with you (the same game, WindowSmash and mods), and how many of them "
+        r->help = "The players of your lobby code who can play with you (the same game, OpenSmash and mods), and how many of them "
                   "are searching for a match.";
     }
     if (st == LB_ON)
@@ -936,6 +975,17 @@ static void build(void)
         snprintf(r->value, sizeof r->value, "%s", ds.pacing == PACING_VRR ? "vrr" : ds.pacing == PACING_DISPLAY ? "display"
                                                                                                                 : "clock");
         note_env(r, "SSBU_PACING");
+        r = add(R_FRAMERATE, K_CHOICE, W_NOW, "Frame rate",
+                "How many frames a second the game draws and reads the controllers: 60, 120 or 240. Its logic stays at 60, so it plays at "
+                "its normal speed (240 keeps Steve's NIL timing as at 60). Online matches run at 60. The PC must keep up: a missed frame is a slowdown.");
+        snprintf(r->value, sizeof r->value, "%d", display_frame_rate());
+        note_env(r, "SSBU_FRAME_RATE");
+        r = add(R_MOTION, K_CHOICE, W_NOW, "Motion between frames",
+                "With 120 or 240 frames a second: the pictures between two game frames show the characters and the camera moving "
+                "instead of standing still. The game and its timing are the same. Interpolate: smooth, as delayed as 60 frames a "
+                "second at most. Extrapolate: no delay, may overshoot a little when something turns at once. Off: as the game draws it.");
+        { int mo = display_motion(); snprintf(r->value, sizeof r->value, "%s", mo == 2 ? "extrapolate" : mo == 1 ? "interpolate" : "off"); }
+        note_env(r, "SSBU_MOTION");
         r = add(R_LATENCY, K_CHOICE, W_NOW, "Frames queued ahead", "How many frames the graphics card may work ahead: 1 is the most responsive, 3 the smoothest on a busy PC. "
                 "Vulkan keeps 2 at least (with 1 the processor and the card wait for each other every frame).");
         snprintf(r->value, sizeof r->value, "%d", ds.latency);
@@ -1282,7 +1332,7 @@ static void build(void)
             break;
         }
         r = add(R_NET_MODE, K_CHOICE, W_RESTART, "Play online in",
-                "Official lobby: everyone's rooms on your region's server (EU / NA East); every match is relayed, so no player's address reaches another. "
+                "Official lobby: everyone's rooms on your region's server (EU / NA East / SA); every match is relayed, so no player's address reaches another. "
                 "Private: only players with the same code. Your own server: host:port. "
                 "Offline: no netplay. This network: a private room hosted on your local network, found by itself.");
         snprintf(r->value, sizeof r->value, "%s", ui_text(NET_MODES[net.mode]));
@@ -1404,8 +1454,12 @@ static void build(void)
             r = add(R_NONE, K_INFO, W_NONE, KEYS[i][0], "Keys that work while playing.");
             snprintf(r->value, sizeof r->value, "%s", KEYS[i][1]);
         }
-        r = add(R_NONE, K_INFO, W_NONE, "Version", "The game version this folder has (version.txt).");
+        r = add(R_NONE, K_INFO, W_NONE, "Game version", "The game version this folder has (version.txt).");
         snprintf(r->value, sizeof r->value, "%s", version[0] ? version : "unknown (no version.txt)");
+        r = add(R_NONE, K_INFO, W_NONE, "OpenSmash (recomp)", "The OpenSmash commit this folder's sources are at, and its date (tools/source_version.txt).");
+        snprintf(r->value, sizeof r->value, "%s", source_version[0] ? source_version : "unknown");
+        r = add(R_NONE, K_INFO, W_NONE, "Launcher", "The version of the OpenSmash launcher that started the game.");
+        snprintf(r->value, sizeof r->value, "%s", launcher_version[0] ? launcher_version : "not started from the launcher");
         break;
     }
     static Row packed[MENU_ROWS];
@@ -1417,7 +1471,7 @@ static void build(void)
             {H, "Window"}, {R_WINDOW, 0}, {R_SIZE, 0},
             {H, "Picture"}, {R_SCALE, 0}, {R_ASPECT, 0}, {R_VIEW, 0}, {R_RENDERER, 0}, /* (#429: the renderer in sight, not behind the switch -
                                                                           * Direct3D 11 is the way out when Vulkan draws wrong on a card) */
-            {H, "Smoothness"}, {R_PACING, 0},
+            {H, "Smoothness"}, {R_PACING, 0}, {R_FRAMERATE, 0}, {R_MOTION, 0},
             {H, "Advanced"}, {R_ADVANCED, 0}, /* (the switch, and under it the rows it shows) */
             {R_CURSOR, 0}, {R_TIMER, 0}, {R_LATENCY, 0}, {R_RUNAHEAD, 0}, {R_OVERLAY, 0}, {R_GPU, 0}};
         static unsigned char used[MENU_ROWS];
@@ -1610,6 +1664,23 @@ static void change(const Row *row, int dir)
         display_set_pacing(p);
         set_display("pacing", p == PACING_VRR ? "vrr" : p == PACING_DISPLAY ? "display"
                                                                             : "clock");
+        break;
+    }
+    case R_FRAMERATE:
+    { /* 60, 120, 240: at once (the vsync thread takes it at its next refresh) */
+        static const int RATES[3] = {60, 120, 240};
+        int f = display_frame_rate(), i = cycle(f >= 240 ? 2 : f >= 120 ? 1 : 0, 3, dir);
+        display_set_frame_rate(RATES[i]);
+        snprintf(v, sizeof v, "%d", RATES[i]);
+        set_display("frame_rate", v);
+        break;
+    }
+    case R_MOTION:
+    { /* off, interpolate, extrapolate: at once (gpu_motion.c takes it at the next picture) */
+        static const char *const MODES[3] = {"off", "interpolate", "extrapolate"};
+        int mo = cycle(display_motion(), 3, dir);
+        display_set_motion(mo);
+        set_display("motion", MODES[mo]);
         break;
     }
     case R_LATENCY:

@@ -380,15 +380,16 @@ class Pages(MenuTest):
         m = self.menu()
         m.key('ESC')
         renderer = ['Renderer'] if sys.platform != 'darwin' else []   # (#429: in sight, under Picture)
-        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Show advanced settings']
+        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Frame rate',
+                   'Motion between frames', 'Show advanced settings']
         self.assertEqual(m.labels(), display)   # (the everyday rows; the rest are behind the switch)
         m.key('DOWN', sum(1 for r in m.rows()[:m.labels().index('Frame pacing')] if r['kind'] != 0))   # (read-only rows are passed over)
         self.assertEqual(m.at()['label'], 'Frame pacing')   # (Viewtype is passed over at 16:9)
-        m.key('DOWN')
+        m.key('DOWN', 3)   # (Frame rate, Motion between frames)
         self.assertEqual(m.at()['label'], 'Show advanced settings')
         m.key('RIGHT')
-        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Show advanced settings',
-                   'Hide the mouse pointer', 'Timer position', 'Frames queued ahead', 'Frame rate in the corner'] + (['Graphics card'] if os.name == 'nt' else [])   # (the advanced rows under the switch)
+        display = ['Window', 'Window size', 'Render scale', 'Aspect ratio', 'Viewtype', *renderer, 'Frame pacing', 'Frame rate',
+                   'Motion between frames', 'Show advanced settings', 'Hide the mouse pointer', 'Timer position', 'Frames queued ahead', 'Frame rate in the corner'] + (['Graphics card'] if os.name == 'nt' else [])   # (the advanced rows under the switch)
         self.assertEqual(m.labels(), display)   # (in sections: Window, Picture, Smoothness, Graphics)
         self.assertIn('show_advanced = 1', (m.dir / 'display.ini').read_text())
         m.type('2')
@@ -413,7 +414,7 @@ class Pages(MenuTest):
         m.type('4')
         keys = (['F1, Cmd+1', 'F2, Cmd+2', 'F3, Cmd+3', 'Option+Return'] if sys.platform == 'darwin'
                 else ['F1', 'F2', 'F3', 'F11, Alt+Enter'])
-        self.assertEqual(m.labels(), ['Interface language', 'Game language', 'Volume', 'Restart the game', 'Quit the game', 'Esc / Home button', *keys, 'Version'])
+        self.assertEqual(m.labels(), ['Interface language', 'Game language', 'Volume', 'Restart the game', 'Quit the game', 'Esc / Home button', *keys, 'Game version', 'OpenSmash (recomp)', 'Launcher'])
 
     @unittest.skipIf(sys.platform == 'darwin', 'the Mac program has no Renderer row (Metal only)')
     def test_renderer_row(self):
@@ -877,10 +878,10 @@ class Region(MenuTest):
         """(#448 on main named the default 'public (worldwide, Epic)'. Here "auto" is the official lobby, relay only, and
         its label says so. Epic Online Services are gone (0.5.0): an "eos" line reads as the official lobby.)"""
         m = self.online()
-        self.assertEqual(m.row('Play online in')['value'], 'official lobby (relay only, EU / NA East)')
+        self.assertEqual(m.row('Play online in')['value'], 'official lobby (relay only, EU / NA East / SA)')
         self.assertIn('Server region', m.labels())
         e = self.online('eos')
-        self.assertEqual(e.row('Play online in')['value'], 'official lobby (relay only, EU / NA East)')
+        self.assertEqual(e.row('Play online in')['value'], 'official lobby (relay only, EU / NA East / SA)')
         self.assertIn('Server region', e.labels())
         self.assertNotIn('Epic', ' '.join(e.labels()))
         e.go_to('Play online in')
@@ -894,15 +895,15 @@ class Region(MenuTest):
         self.assertIn('Players on another region are not listed.', r['help'])
         self.assertEqual(m.labels().index('Server region'), m.labels().index('Play online in') + 1)
         m.go_to('Server region')
-        for value, saved in (('EU', 'eu'), ('NA East', 'na-east'), ('Auto (EU, 24 ms)', 'auto')):
+        for value, saved in (('EU', 'eu'), ('NA East', 'na-east'), ('South America', 'sa'), ('Auto (EU, 24 ms)', 'auto')):
             m.key('RIGHT')
             self.assertEqual((m.row('Server region')['value'], m.file('config/server_region.txt')), (value, saved))
         m.key('LEFT')
-        self.assertEqual((m.row('Server region')['value'], m.file('config/server_region.txt')), ('NA East', 'na-east'))
+        self.assertEqual((m.row('Server region')['value'], m.file('config/server_region.txt')), ('South America', 'sa'))
         self.assertIn('Restart now', m.labels())   # (the next start plays there)
         m.key('ESC')
         m.key('ESC')   # (opened again: read from the file)
-        self.assertEqual(m.row('Server region')['value'], 'NA East')
+        self.assertEqual(m.row('Server region')['value'], 'South America')
 
     def test_the_file_as_it_is_read(self):
         for text, value in (('NA-East\n', 'NA East'), ('# mine\neu\n', 'EU'), ('moon\n', 'Auto (NA East, 31 ms)'), ('auto\n', 'Auto (NA East, 31 ms)')):
@@ -997,28 +998,28 @@ class Rooms(MenuTest):
         rows = {r['label']: r for r in m.rows()}
         self.assertEqual([(k, rows[k]['value']) for k in ('Alpha (you)', 'Bravo', 'Golf', 'Charlie', 'Delta', 'Echo', 'Foxtrot')],
                          [('Alpha (you)', '1/4 players, open'), ('Bravo', '2/4 players, open - A: join'), ('Golf', '4/4 players, full or closed'),
-                          ('Charlie', "can't join: update your WindowSmash"), ('Delta', "can't join: their WindowSmash is older"),
+                          ('Charlie', "can't join: update your OpenSmash"), ('Delta', "can't join: their OpenSmash is older"),
                           ('Echo', "can't join: another game version"), ('Foxtrot', "can't join: other mods")])
-        game = f'Game build {BUILD[:8]} (yours too), WindowSmash simulation version {SIM} (yours too), netplay version 3'
+        game = f'Game build {BUILD[:8]} (yours too), OpenSmash simulation version {SIM} (yours too), netplay version 3'
         self.assertEqual(rows['Bravo']['help'], "Bravo's room, 2 of 4 players. A: put it first in Local Wireless > Rooms List, then close this menu "
                                                 f"and pick it there. / {game} / Mods: none")   # (the room's game and mods, against yours)
         self.assertIn(f'Game build {OTHER_BUILD[:8]} (yours {BUILD[:8]})', rows['Echo']['help'])
         self.assertIn(f'simulation version {SIM + 1} (yours {SIM})', rows['Charlie']['help'])
         self.assertIn(f'simulation version is {SIM + 1}, yours {SIM}', rows['Charlie']['help'])
-        self.assertIn('Yours is the older one: update WindowSmash to join.', rows['Charlie']['help'])
+        self.assertIn('Yours is the older one: update OpenSmash to join.', rows['Charlie']['help'])
         self.assertIn('Theirs is the older one: the host needs to update.', rows['Delta']['help'])
         self.assertIn(f'build {OTHER_BUILD[:8]}, yours {BUILD[:8]}', rows['Echo']['help'])
         self.assertEqual(rows['Foxtrot']['help'], f"Mods you don't have: Alpha / {game} / Mods: Alpha (you don't have it)")
         for label, said in (('Bravo', "Bravo's room comes first now: close this menu, then Local Wireless > Rooms List"),
                             ('Alpha (you)', 'This is your own room'),
                             ('Golf', "Golf's room is full or closed for now"),
-                            ('Charlie', "Can't join Charlie's room: update your WindowSmash")):
+                            ('Charlie', "Can't join Charlie's room: update your OpenSmash")):
             m.go_to(label)
             m.key('ENTER')
             self.assertEqual(m.toast(), said)
         self.assertEqual(m.page()[0], 1)   # (the menu stays open)
         m.go_to('Charlie')   # (its help's second line on a line of its own)
-        self.assertTrue(any('needs updating) / Yours is the older one: update WindowSmash to join.' in line for line in m.draw()))
+        self.assertTrue(any('needs updating) / Yours is the older one: update OpenSmash to join.' in line for line in m.draw()))
 
     def test_many_rooms_paged_and_picked(self):
         """More rooms than a page: 30 at a time, More/Earlier rooms; A on one puts it first in the game's Rooms List
@@ -1182,7 +1183,7 @@ class RealLobby(MenuTest):
         rows = m.rows()
         got = {r['label']: r['value'] for r in rows if r['id'] >= 60}
         self.assertEqual([r['label'] for r in rows if r['id'] >= 60][0], 'Same')   # (the rooms of this game's key first)
-        self.assertEqual(got, {'Same': '1/8 players, open - A: join', 'Newer': "can't join: update your WindowSmash", 'Modded': "can't join: other mods",
+        self.assertEqual(got, {'Same': '1/8 players, open - A: join', 'Newer': "can't join: update your OpenSmash", 'Modded': "can't join: other mods",
                                'Older': "can't join: another game version"})
 
 
