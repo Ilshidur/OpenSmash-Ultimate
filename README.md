@@ -1,3 +1,54 @@
+# OpenSmash-Ultimate, fork for program-driven fights
+
+> **This is a fork** of [OpenSmash-Ultimate](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate). It follows upstream `main` (last merge: **v0.5.1**) and adds a handful of switches to the runtime, all off by default. Installing, building, playing and going online are upstream's work and are described in their README, kept unchanged [below](#opensmash-ultimate).
+>
+> Like upstream, **this repository does not contain the game**: no game files, keys, firmware or saves.
+
+## What this fork is for
+
+Running fights **under the control of a program** rather than of a person:
+
+- an agent plays through a virtual pad, alone or against a person on a real controller;
+- a recorded fight is replayed input for input and compared with the original, frame by frame;
+- a search tries inputs from a saved state of the game, goes back to it and tries others, thousands of times;
+- several such games run at once on one PC, without drawing anything.
+
+Upstream already has most of what this needs: fights set up without the menus (`SSBU_DEBUG_MATCH`), scripted menu input (`SSBU_SEQ`), fixed randomness (`SSBU_DETERMINISTIC`), a rollback core that saves and restores the whole game (`SSBU_RB`), and native mods that read the game's state. See upstream's [testing runs](docs/TESTING-RUNS.md) and [how it works](docs/TECHNICAL.md). This fork adds the missing pieces. The programs that drive the game (the mod, the agent, the search) are not part of this repository.
+
+## What it adds
+
+Each addition is an environment variable read by the runtime (`runtime/`). Nothing changes unless it is set, with one exception noted in the last row.
+
+| Switch | What it does | Where |
+| :--- | :--- | :--- |
+| `SSBU_RB_REQ=save` / `load` | **Savestates on request.** Code inside the process (a native mod) sets the variable; the runtime serves it at its next safe point. `save` keeps the game's full state before the next frame is played; `load` goes back to the newest state kept. `SSBU_RB_DONE` then reads `<saves> <loads> <pinned>`: counts of what was really done, so the caller knows on which frame a request took effect (a request can be served one frame later; a refused load is tried again). Needs the rollback core (`SSBU_RB=1`). | `runtime/hle_rb_core.c` |
+| `SSBU_RB_REQ=base` / `loadbase` | **A state to come back to, however many saves follow**: typically the first frame of a fight, to play it again and again with other inputs without starting the game again. `base` saves a state and pins it; `loadbase` returns to it, in about 15 ms. The third number of `SSBU_RB_DONE` says whether the pinned state is still there. | `runtime/hle_rb_core.c`, `runtime/hle_rb_state.c` |
+| `SSBU_NO_DRAW=1` | Nothing is drawn or cleared: state-only runs, several games side by side. | `runtime/gpu_queue.c` |
+| `SSBU_SEQ_RELEASE=1` | With `SSBU_SEQ`: once the menu sequence has ended, player 1 gets its pad back, so that a person or a program plays the fight the sequence set up. | `runtime/hle_hid.c` |
+| `SSBU_XINPUT_EXTRA=<n>` | With SDL pads: XInput pad `n` is read as well, as player `n + 1`. A program's virtual pad plays beside a person's own controller. | `runtime/hle_pad.c` |
+| `SSBU_DEBUG_MATCH=p1=cpu,...` | `p1` takes `cpu` or `human`, as `p2` does: a match between two CPU players. | `runtime/fight_test.h` |
+| `SSBU_RB_FIBER_FREE=0` | Turns **off** a fix this fork makes by default: host fibers that no savestate needs any more are deleted. Without the fix, a search that loads one state thousands of times leaked about 0.27 GB a minute. | `runtime/hle_fiber.c` |
+
+Also: menu sequences can be twice as long (`SEQ_STEPS`, `runtime/input_seq.h`).
+
+### The pinned state, in short
+
+The rollback core keeps a ring of states: one full copy of guest memory, which is the newest state, and for each older state the pages a later save overwrote. When the ring is full, the oldest state goes. A pinned state stays: the state just newer than it goes instead, and its record is folded into the pinned one's, so that the pinned state can still be rebuilt from the newest one. A new memory mapping still drops it, and `SSBU_RB_DONE` says so.
+
+Checked on our runs: recorded fights replayed after `loadbase`, one after the other in the same game, are identical frame for frame to the same fights in a freshly started game, and a search of some 49,000 frames gives the same result twice in a row.
+
+## Building and staying in sync
+
+Build exactly as upstream does ([setup guide](docs/BUILDING.md)). The fork differs from upstream `main` by eight files under `runtime/` and by this README; `git diff <upstream commit> main -- runtime` shows all of it. It is kept up to date by merging upstream `main` from time to time; the one place that usually conflicts is `runtime/hle_pad.c`.
+
+Tested on Windows only. These switches are not supported by the upstream project: please do not report problems with them there.
+
+License: GPL-3.0-or-later, as upstream.
+
+---
+
+*Below: the original project's README, unchanged.*
+
 # OpenSmash-Ultimate
 
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pkgyYGf3YB)
