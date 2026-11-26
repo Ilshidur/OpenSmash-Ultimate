@@ -407,6 +407,8 @@ void rb_load(Cpu *c, u64 frame);
 void rb_load_age(Cpu *c, u64 frame, int age);
 void rb_ring_size(int n);
 int rb_ring_count(void);
+void rb_pin_oldest(int on);   /* (hle_rb_state.c: the ring's oldest state stays while later saves come and go) */
+int rb_pinned(void);
 void rb_quiet(int q);
 int gfx_window_focused(void);
 static long long auto_at = -1, auto_every, auto_left = 100, auto_next;
@@ -4488,17 +4490,29 @@ static void savestates(Cpu *c, u64 frame) {
      * SSBU_RB_DONE as "<saves> <loads>" (counts since the start), so the mod can tell the frame a save or a load took
      * effect: a request may be served a safe point later than the mod expects, and a load can be refused (a thread
      * not parked in time), in which case it stays requested and is tried again at the next safe point.
-     * Nothing may follow rb_save / rb_load but the return (a load comes back through rb_save's call, which returns 2). */
+     * Nothing may follow rb_save / rb_load but the return (a load comes back through rb_save's call, which returns 2).
+     * "base" and "loadbase": a state to come back to however many "save"s follow - the first frame of a fight, to play it
+     * again with other inputs without starting the game again. "base" drops the states kept, gives the ring 3 states and
+     * pins the one it saves (rb_pin_oldest); "loadbase" goes back to it, counted as a load. SSBU_RB_DONE's third number
+     * says whether the pinned state is still there (a barrier drops it): without it "loadbase" does nothing. */
     {   static int req_saves, req_loads;
-        char req[16], done[32];
+        char req[16], done[48];
         DWORD rn = GetEnvironmentVariableA("SSBU_RB_REQ", req, sizeof req);
         if (rn > 0 && rn < sizeof req) {
             SetEnvironmentVariableA("SSBU_RB_REQ", NULL);
-            if (!strcmp(req, "save")) {
+            if (!strcmp(req, "save") || !strcmp(req, "base")) {
+                int base = req[0] == 'b';
+                if (base) { rb_ring_size(3); rb_pin_oldest(1); }
                 int r = rb_save(c, frame);
-                if (r == 1) req_saves++; else if (r == 2) req_loads++;
-                snprintf(done, sizeof done, "%d %d", req_saves, req_loads);
+                if (r == 1) req_saves++; else if (r == 2) req_loads++; else if (base) rb_pin_oldest(0);
+                snprintf(done, sizeof done, "%d %d %d", req_saves, req_loads, rb_pinned());
                 SetEnvironmentVariableA("SSBU_RB_DONE", done);
+                return;
+            }
+            if (!strcmp(req, "loadbase")) {
+                if (!rb_pinned()) { fprintf(stderr, "[rb] loadbase: no pinned state (never saved, or dropped)\n"); return; }
+                rb_load_age(c, frame, rb_ring_count() - 1);          /* (returns only when the load was refused) */
+                SetEnvironmentVariableA("SSBU_RB_REQ", "loadbase");  /* tried again at the next safe point */
                 return;
             }
             if (!strcmp(req, "load")) {

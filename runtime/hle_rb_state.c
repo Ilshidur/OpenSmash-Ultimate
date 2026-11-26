@@ -2332,6 +2332,96 @@ static void ring_keep(int keep) {
     while (ring_count > keep) { slot_free(slot_at(ring_count - 1)); ring_count--; }
 }
 
+/* ---- a pinned state (hle_rb_core.c: SSBU_RB_REQ "base" and "loadbase") ----
+ * rb_pin_oldest(1), then a save into an empty ring: that state stays however many saves follow: a state to come back to
+ * (rb_load_age with rb_ring_count() - 1), such as the first frame of a fight played again and again with other inputs. With
+ * the ring full, the state just newer than it goes instead, its undo record folded into the pinned one's (pin_fold). The ring
+ * needs 3 states for this (the pinned one, the newest, and the one the next save replaces). What still drops the pinned
+ * state: a barrier (new mappings), the GPU's bytes lost, a record that cannot grow, rb_ring_size and rb_ring_drop.
+ * It is known by its save number, so whatever dropped the states, rb_pinned() says 0 from then on. */
+static int pin_next;          /* (rb_pin_oldest(1)) the next state saved is the pinned one */
+static long long pin_seq;     /* the pinned state's save number; 0: none */
+static long long pin_folds;
+void rb_pin_oldest(int on) { pin_next = on != 0; if (!on) pin_seq = 0; }
+int rb_pinned(void) { return pin_seq && ring_count > 0 && slot_at(ring_count - 1)->seq == pin_seq; }
+/* The state just newer than the pinned one, x, let go: 1 (a slot is free), 0 (not possible: the caller drops the pinned
+ * state). The pinned record says how to get from x to the pinned state, x's how to get from the newest state to x; the
+ * record made here, how to get from the newest state to the pinned one. A page in the pinned record alone was the same in
+ * x and the newest state; a page in x's record alone, the same in x and the pinned state: both entries stand as they are.
+ * A page in both keeps the pinned record's content, and its kind follows from where the page was:
+ *   x's entry U_COMMIT (absent in the newest state): U_CONTENT becomes U_COMMIT; U_ABSENT: absent in both, no entry;
+ *   x's entry U_ABSENT (present in the newest state, absent in x): the pinned one's is U_COMMIT, and becomes U_CONTENT;
+ *   x's entry U_CONTENT: the pinned one's stands (U_CONTENT or U_ABSENT).
+ * Any other pair cannot be: 0. (Called from rb_save with every guest thread held: the records are settled, hold.) */
+static int pin_fold(void) {
+    if (ring_count < 3) return 0;
+    Slot *b = slot_at(ring_count - 1), *x = slot_at(ring_count - 2);
+    Undo *to = &b->undo, *from = &x->undo;
+    static u64 *set;
+    static u32 *at;
+    static u32 set_cap;
+    u32 want = 64;
+    while (want < (to->n + from->n) * 2u) want <<= 1;
+    if (want > set_cap) {
+        u64 *grown = realloc(set, sizeof *grown * want);
+        if (grown) set = grown;
+        u32 *where = grown ? realloc(at, sizeof *where * want) : NULL;
+        if (where) at = where;
+        if (!where) return 0;
+        set_cap = want;
+    }
+    memset(set, 0, sizeof *set * want);
+    u32 mask = want - 1, dead = 0;
+#define PIN_HASH(p) ((u32)((((u64)(uintptr_t)(p) >> 12) * 0x9E3779B97F4A7C15ull) >> 40) & mask)
+    for (u32 i = 0; i < to->n; i++) {
+        u32 h = PIN_HASH(to->cur[i]);
+        while (set[h]) h = (h + 1) & mask;
+        set[h] = (u64)(uintptr_t)to->cur[i]; at[h] = i;
+    }
+    for (u32 i = 0; i < from->n; i++) {
+        u64 p = (u64)(uintptr_t)from->cur[i];
+        u32 h = PIN_HASH(from->cur[i]);
+        while (set[h] && set[h] != p) h = (h + 1) & mask;
+        if (set[h]) {
+            u32 j = at[h];
+            u8 newer = from->how[i], pinned = to->how[j];
+            if (newer == U_COMMIT) {
+                if (pinned == U_CONTENT) to->how[j] = U_COMMIT;
+                else if (pinned == U_ABSENT) { to->cur[j] = NULL; dead++; }
+                else return 0;
+            } else if (newer == U_ABSENT) {
+                if (pinned == U_COMMIT) to->how[j] = U_CONTENT;
+                else return 0;
+            } else if (pinned == U_COMMIT) return 0;
+            continue;
+        }
+        if (to->n == to->cap && !undo_more(to)) return 0;
+        to->cur[to->n] = from->cur[i]; to->how[to->n] = from->how[i];
+        if (from->how[i] != U_ABSENT) memcpy(to->data + ((size_t)to->n << 12), from->data + ((size_t)i << 12), 0x1000);
+        to->n++;
+    }
+#undef PIN_HASH
+    if (dead) {   /* (the entries of pages absent in both states taken out: the later ones moved down) */
+        u32 w = 0;
+        for (u32 i = 0; i < to->n; i++) {
+            if (!to->cur[i]) continue;
+            if (w != i) {
+                to->cur[w] = to->cur[i]; to->how[w] = to->how[i];
+                if (to->how[i] != U_ABSENT) memcpy(to->data + ((size_t)w << 12), to->data + ((size_t)i << 12), 0x1000);
+            }
+            w++;
+        }
+        to->n = w;
+    }
+    u32 held = to->n;
+    slot_free(x);
+    Slot moved = *x; *x = *b; *b = moved;                  /* (the pinned state one place newer; the free slot is the oldest place, the next save's) */
+    ring_count--;
+    if (++pin_folds <= 3 || pin_folds % 500 == 0)
+        fprintf(stderr, "[rb] pinned state: fold %lld, its record holds %u pages (%u MB)\n", pin_folds, held, held >> 8);
+    return 1;
+}
+
 /* N states (1..64), before the first save. */
 void rb_ring_size(int n) {
     if (n < 1) n = 1;
@@ -2480,7 +2570,10 @@ __declspec(noinline) int rb_save(Cpu *c, u64 frame) {
     if (drain_now) gpu_queue_drain();
     double t1 = now_ms();
     rb_save_parts[0] += tp - t0; rb_save_parts[1] += t1 - tp;
-    if (ring_count == ring_size) { slot_free(slot_at(ring_count - 1)); ring_count--; }   /* (the oldest) */
+    if (ring_count == ring_size && !(rb_pinned() && pin_fold())) {   /* (the oldest goes; with a pinned state, the one just newer) */
+        if (rb_pinned()) { pin_seq = 0; fprintf(stderr, "[rb] pinned state: dropped (a ring of %d states, or its record cannot grow)\n", ring_size); }
+        slot_free(slot_at(ring_count - 1)); ring_count--;
+    }
     Slot *prev = ring_count ? slot_at(0) : NULL;
     Slot *s = &ring[ring_count ? (ring_head + 1) % ring_size : ring_head];
     RtlCaptureContext(&s->main);
@@ -2516,7 +2609,10 @@ __declspec(noinline) int rb_save(Cpu *c, u64 frame) {
     rb_map_census_end();
     if (reprot_now) gpu_reprotect_now();
     undo_to = NULL;
-    if (barrier && ring_count) { ring_keep(0); barriers++; }   /* (s is not among them: it was free) */
+    if (barrier && ring_count) {   /* (s is not among them: it was free) */
+        if (rb_pinned()) { pin_seq = 0; fprintf(stderr, "[rb] pinned state: dropped at a barrier (new mappings)\n"); }
+        ring_keep(0); barriers++;
+    }
     u64 fib_bytes, live[1025]; u32 suspended, jmps, in_use;
     u32 nlive = live_stacks(c->thread, live);
     s->kernel = kernel_rb_save();
@@ -2551,6 +2647,7 @@ __declspec(noinline) int rb_save(Cpu *c, u64 frame) {
     memcpy(s->main_stack, (void *)(uintptr_t)s->main.Rsp, s->main_n);
     if (!main_scratch) main_scratch = VirtualAlloc(NULL, SCRATCH, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     s->have = 1; s->seq = ++saves; s->tag = rb_save_tag;
+    if (pin_next) { pin_next = 0; pin_seq = ring_count ? 0 : s->seq; }   /* (pinned only as the ring's one state: its oldest) */
     ring_head = (int)(s - ring); ring_count++;
     rb_keep_fibers = 1;
     if (keep_hold) { keep_hold = 0; held = 1; held_n = n; memory_untouched = 1; }   /* (a load follows at once: rb_load_age) */
